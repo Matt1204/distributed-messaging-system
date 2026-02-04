@@ -1,0 +1,19 @@
+## Maven build outputs
+**/target/
+**/dependency-reduced-pom.xml
+**/*.log
+
+## IDEs and editors
+.idea/
+*.iml
+*.ipr
+*.iws
+.classpath
+.project
+.settings/
+.vscode/
+
+## OS files
+.DS_Store
+
+design.md

@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package com.coen6731.chat;
+
+// These options configure how the Java code is generated from this proto file.
+// java_multiple_files = true: Generates separate .java files for each class (Service, Messages).
+// java_package: The package for the generated Java classes.
+// java_outer_classname: The class name for the wrapper class (if java_multiple_files was false).
+option java_multiple_files = true;
+option java_package = "com.coen6731.chat";
+option java_outer_classname = "ChatProto";
+
+// Service definition for our chat application.
+// gRPC services are defined using the 'service' keyword.
+service MessagingService {
+  // A bidirectional streaming RPC.
+  // Both the client and server can send a stream of messages to each other.
+  // 'stream ClientEvent' means the client sends a stream of ClientEvent messages.
+  // 'returns (stream ServerEvent)' means the server responds with a stream of ServerEvent messages.
+  rpc Chat(stream ClientEvent) returns (stream ServerEvent);
+}
+
+// Represents an event sent from the client to the server.
+message ClientEvent {
+  // 'oneof' ensures that only one of the fields inside it is set at a time.
+  // This is useful for polymorphic messages where a ClientEvent can be a Register, SendMessage, or Heartbeat.
+  oneof payload {
+    Register register = 1;
+    SendMessage sendMessage = 2; // message from client to server.
+    Heartbeat heartbeat = 3;
+  }
+}
+
+// Represents an event sent from the server to the client.
+message ServerEvent {
+  oneof payload {
+    ChatMessage chatMessage = 1; // message from server to client.
+    ServerError serverError = 2;
+  }
+}
+
+// Message for registering a user.
+message Register {
+  string userId = 1; // The unique identifier for the user.
+}
+
+// Message for sending a text message to another user.
+message SendMessage {
+  string toUserId = 1; // The recipient's user ID.
+  string text = 2;     // The content of the message.
+  string clientMsgId = 3; // A client-generated ID for tracking/deduplication.
+}
+
+// Heartbeat message to keep the connection alive.
+message Heartbeat {
+  int64 ts = 1; // Timestamp of the heartbeat.
+}
+
+// Represents a delivered message.
+message ChatMessage {
+  string fromUserId = 1; // The sender's user ID.
+  string text = 2;       // The message content.
+  string serverMsgId = 3; // Unique ID assigned by the server.
+  int64 ts = 4;          // Timestamp when the message was processed by the server.
+}
+
+// Represents an error condition.
+message ServerError {
+  string code = 1;   // Error code (e.g., "USER_OFFLINE").
+  string reason = 2; // Human-readable error message.
+}
