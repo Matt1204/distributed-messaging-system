@@ -3,12 +3,15 @@ package com.coen6731.chat.server;
 import com.coen6731.chat.ServerEvent;
 import com.coen6731.chat.ServerError;
 import io.grpc.stub.StreamObserver;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Represents an active user session on the server.
  * Encapsulates the gRPC stream and heartbeat state.
  */
 public class UserSession {
+  private static final Logger logger = LoggerFactory.getLogger(UserSession.class);
   private final StreamObserver<ServerEvent> responseObserver;
   private volatile long lastHeartbeat;
 
@@ -37,7 +40,7 @@ public class UserSession {
     try {
       responseObserver.onNext(event);
     } catch (Exception e) {
-      System.out.println("[server] error sending to session: " + e.getMessage());
+      logger.warn("[server] error sending to session", e);
     }
   }
 
@@ -61,7 +64,7 @@ public class UserSession {
     }
   }
 
-  public void close() {
+  public synchronized void close() {
     try {
       responseObserver.onCompleted();
     } catch (Exception ignored) {

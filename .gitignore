@@ -13,7 +13,9 @@
 .settings/
 .vscode/
 
+.env
+
 ## OS files
 .DS_Store
-
-design.md
+*.md
+*.db

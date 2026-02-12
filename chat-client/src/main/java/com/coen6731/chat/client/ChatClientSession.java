@@ -1,136 +1,191 @@
 package com.coen6731.chat.client;
 
-import com.coen6731.chat.ChatMessage;
+import com.coen6731.chat.Catchup;
+import com.coen6731.chat.RegisterUser;
 import com.coen6731.chat.ClientEvent;
-import com.coen6731.chat.Heartbeat;
 import com.coen6731.chat.MessagingServiceGrpc;
-import com.coen6731.chat.Register;
 import com.coen6731.chat.SendMessage;
-import com.coen6731.chat.ServerError;
-import com.coen6731.chat.ServerEvent;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
-import io.grpc.Status;
-import io.grpc.StatusRuntimeException;
+import io.grpc.Metadata;
+import io.grpc.stub.MetadataUtils;
 import io.grpc.stub.StreamObserver;
-import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * Manages a single gRPC chat session.
- * Responsible for channel lifecycle, stream observers, and heartbeat scheduling.
- */
 public class ChatClientSession {
-  private final ManagedChannel channel;
-  private final StreamObserver<ClientEvent> requestObserver;
-  private final ScheduledExecutorService heartbeatExecutor;
-  private final AtomicBoolean heartbeatStarted = new AtomicBoolean(false);
+  private final String target;
+  private final DatabaseManager dbManager;
+  private String currentUserId;
 
-  public ChatClientSession(String target) {
-    // Create a channel to the server. 'usePlaintext()' is used for unencrypted communication (dev only).
-    this.channel = ManagedChannelBuilder.forTarget(target).usePlaintext().build();
+  private ManagedChannel channel;
+  private StreamObserver<ClientEvent> requestObserver;
 
-    // Create an async stub. Stubs are used to call service methods.
-    MessagingServiceGrpc.MessagingServiceStub stub = MessagingServiceGrpc.newStub(channel);
+  private final ScheduledExecutorService scheduler;
+  private final HeartbeatManager heartbeatManager;
 
-    // Executor for sending heartbeat messages periodically.
-    this.heartbeatExecutor = Executors.newSingleThreadScheduledExecutor();
+  private final AtomicBoolean isConnected = new AtomicBoolean(false);
+  private final AtomicBoolean isReconnecting = new AtomicBoolean(false);
 
-    // Initiate the bidirectional stream.
-    // The call returns a requestObserver that we use to send client events.
-    this.requestObserver = stub.chat(createResponseObserver());
+  private int reconnectDelayMs = 1000;
+  private static final int MAX_RECONNECT_DELAY_MS = 5000;
+
+  public ChatClientSession(String target, String dbPath) {
+    this.target = target;
+    this.dbManager = new DatabaseManager(dbPath);
+    // 2 threads: 1 for heartbeat (managed by HeartbeatManager), 1 for lifecycle/reconnect tasks
+    this.scheduler = Executors.newScheduledThreadPool(2);
+
+    // Initialize HeartbeatManager
+    this.heartbeatManager = new HeartbeatManager(scheduler, this::triggerReconnect);
+    // Provide access to the current requestObserver
+    this.heartbeatManager.setRequestObserverSupplier(() -> this.requestObserver);
+
+    String storedUserId = dbManager.getUserId();
+    System.out.println("[client] read db " + dbPath + " logged in as " + storedUserId);
+    
+    if (storedUserId != null && !storedUserId.isBlank()) {
+      this.currentUserId = storedUserId;
+      connect();
+    } else {
+      System.out.println("[client] no user_id in database; use /register <userId> to set one");
+      this.requestObserver = null; 
+    }
   }
 
-  public void register(String userId) {
-    Register register = Register.newBuilder().setUserId(userId).build();
-    requestObserver.onNext(ClientEvent.newBuilder().setRegister(register).build());
+  private synchronized void connect() {
+    // If already connected, do nothing
+    if (isConnected.get()) return;
 
-    // Start heartbeats after successful registration attempt.
-    if (heartbeatStarted.compareAndSet(false, true)) {
-      startHeartbeat();
+    try {
+      System.out.println("[client] Connecting to " + target + "...");
+      
+      ManagedChannelBuilder<?> builder = ManagedChannelBuilder.forTarget(target);
+      if (target.endsWith(":443")) {
+        builder.useTransportSecurity();
+      } else {
+        builder.usePlaintext();
+      }
+      this.channel = builder.build();
+
+      MessagingServiceGrpc.MessagingServiceStub stub = MessagingServiceGrpc.newStub(channel);
+
+      Metadata metadata = new Metadata();
+      metadata.put(Metadata.Key.of("x-user-id", Metadata.ASCII_STRING_MARSHALLER), currentUserId);
+      stub = stub.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(metadata));
+
+      // Create Response Handler
+      ServerResponseHandler responseHandler = new ServerResponseHandler(
+          dbManager, 
+          heartbeatManager, 
+          this::triggerReconnect, 
+          currentUserId
+      );
+      
+      this.requestObserver = stub.chat(responseHandler);
+      
+      isConnected.set(true);
+      reconnectDelayMs = 1000; // Reset backoff on successful connection setup
+      
+      heartbeatManager.start();
+      // sendCatchup();
+      
+      System.out.println("[client] Connected.");
+    } catch (Exception e) {
+      System.out.println("[client] Connection setup failed: " + e.getMessage());
+      triggerReconnect();
+    }
+  }
+
+  private synchronized void triggerReconnect() {
+    if (isReconnecting.getAndSet(true)) {
+        return; // Already reconnecting
+    }
+    
+    teardown();
+    
+    // Exponential backoff + Jitter
+    int jitter = (int)(Math.random() * 500);
+    int delay = reconnectDelayMs + jitter;
+    
+    System.out.println("[client] Reconnecting in " + delay + "ms...");
+    
+    scheduler.schedule(() -> {
+        isReconnecting.set(false);
+        connect();
+    }, delay, TimeUnit.MILLISECONDS);
+    
+    reconnectDelayMs = Math.min(reconnectDelayMs * 2, MAX_RECONNECT_DELAY_MS);
+  }
+
+  private void teardown() {
+    System.out.println("[client] Teardown (cleaning up resources)...");
+    heartbeatManager.stop();
+    
+    isConnected.set(false);
+    
+    if (requestObserver != null) {
+        try { requestObserver.onCompleted(); } catch (Exception e) {}
+        requestObserver = null;
+    }
+    
+    if (channel != null) {
+        channel.shutdownNow();
+        channel = null;
     }
   }
 
   public void sendMessage(String toUserId, String text) {
-    SendMessage sendMessage =
-        SendMessage.newBuilder()
-            .setToUserId(toUserId)
-            .setText(text)
-            .setClientMsgId(UUID.randomUUID().toString())
-            .build();
-    requestObserver.onNext(ClientEvent.newBuilder().setSendMessage(sendMessage).build());
+    if (requestObserver == null) {
+        System.out.println("[client] Not connected. Queuing not implemented.");
+        return;
+    }
+    SendMessage sendMessage = SendMessage.newBuilder()
+        .setToUserId(toUserId)
+        .setText(text)
+        .setClientMsgId(UUID.randomUUID().toString())
+        .build();
+    try {
+        requestObserver.onNext(ClientEvent.newBuilder().setSendMessage(sendMessage).build());
+    } catch (Exception e) {
+        System.out.println("[client] Failed to send message: " + e.getMessage());
+        triggerReconnect();
+    }
   }
 
   public void close() {
-    requestObserver.onCompleted();
-    heartbeatExecutor.shutdownNow();
-    channel.shutdownNow();
+    System.out.println("[client] Closing session...");
+    scheduler.shutdownNow();
+    teardown();
   }
 
-  private StreamObserver<ServerEvent> createResponseObserver() {
-    // Observer to handle incoming messages FROM the server (ServerEvent).
-    return new StreamObserver<>() {
-      @Override
-      public void onNext(ServerEvent value) {
-        switch (value.getPayloadCase()) {
-          case CHATMESSAGE:
-            ChatMessage msg = value.getChatMessage();
-            System.out.println(
-                msg.getFromUserId()
-                    + ": "
-                    + msg.getText()
-                    + " ("
-                    + msg.getServerMsgId()
-                    + ", "
-                    + msg.getTs()
-                    + ")");
-            break;
-          case SERVERERROR:
-            ServerError err = value.getServerError();
-            System.out.println("ERROR code=" + err.getCode() + " reason=" + err.getReason());
-            break;
-          case PAYLOAD_NOT_SET:
-          default:
-            System.out.println("[client] received empty event");
-            break;
-        }
-      }
+  public void sendRegisterUser(String userId, String userName) {
+    if (requestObserver == null) {
+      System.out.println("[client] Not connected. Queuing not implemented.");
+      return;
+    }
+    RegisterUser registerUser = RegisterUser.newBuilder()
+      .setUserId(userId)
+      .setUserName(userName)
+      .build();
+    requestObserver.onNext(ClientEvent.newBuilder().setRegisterUser(registerUser).build());
+  }
 
-      @Override
-      public void onError(Throwable t) {
-        if (t instanceof StatusRuntimeException) {
-          StatusRuntimeException sre = (StatusRuntimeException) t;
-          Status status = sre.getStatus();
-          if (status.getCode() == Status.Code.UNAVAILABLE) {
-            System.out.println("[client] onError() - server unavailable, code" + status.getCode());
-            return;
+  private void sendCatchup() {
+      try {
+          if (requestObserver != null) {
+              Catchup catchup = Catchup.newBuilder()
+                  .setUserId(currentUserId)
+                  .setLastSyncSequenceId(0) // TODO: Get from DB
+                  .build();
+              requestObserver.onNext(ClientEvent.newBuilder().setCatchup(catchup).build());
+              System.out.println("[client] Sent Catchup request");
           }
-          System.out.println("[client] onError() - stream error: " + status);
-          return;
-        }
-        System.out.println("[client] onError() - stream error: " + t.getMessage());
+      } catch (Exception e) {
+          System.out.println("[client] Failed to send catchup: " + e.getMessage());
       }
-
-      @Override
-      public void onCompleted() {
-        System.out.println("[client] stream closed by server");
-      }
-    };
-  }
-
-  // Sends a heartbeat message every 10 seconds to keep the connection alive.
-  private void startHeartbeat() {
-    heartbeatExecutor.scheduleAtFixedRate(
-        () -> {
-          Heartbeat heartbeat = Heartbeat.newBuilder().setTs(Instant.now().toEpochMilli()).build();
-          requestObserver.onNext(ClientEvent.newBuilder().setHeartbeat(heartbeat).build());
-        },
-        10,
-        10,
-        TimeUnit.SECONDS);
   }
 }

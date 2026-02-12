@@ -1,45 +1,53 @@
 package com.coen6731.chat.server;
 
-import io.grpc.Server;
-import io.grpc.ServerBuilder;
-import java.io.IOException;
+import io.github.cdimascio.dotenv.Dotenv;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * The main entry point for the Chat Server.
- * This class is responsible for starting the gRPC server and registering services.
+ * We bootstrap Spring Boot here and let Spring manage the gRPC server lifecycle.
  */
+@SpringBootApplication
 public class ChatServer {
-  public static void main(String[] args) throws IOException, InterruptedException {
-    // Default port is 50051, but can be overridden by command line arguments.
-    int port = 50051;
-    if (args.length > 0) {
-      port = Integer.parseInt(args[0]);
+  private static final Logger logger = LoggerFactory.getLogger(ChatServer.class);
+
+  public static void main(String[] args) {
+    Dotenv dotenv = Dotenv.configure()
+        .directory("chat-server")
+        .ignoreIfMissing()
+        .load();
+    dotenv.entries().forEach(entry -> {
+      if (System.getProperty(entry.getKey()) == null && System.getenv(entry.getKey()) == null) {
+        System.setProperty(entry.getKey(), entry.getValue());
+      }
+    });
+
+    // We now prefer environment variables for port configuration.
+    // Use CHAT_GRPC_PORT or PORT, falling back to 50051.
+    String envPort = System.getProperty("CHAT_GRPC_PORT");
+    if (envPort == null || envPort.isBlank()) {
+      envPort = System.getenv("CHAT_GRPC_PORT");
+    }
+    if (envPort == null || envPort.isBlank()) {
+      envPort = System.getProperty("PORT");
+    }
+    if (envPort == null || envPort.isBlank()) {
+      envPort = System.getenv("PORT");
     }
 
-    // registry holds the active client connections.
-    ConnectionRegistry registry = new ConnectionRegistry();
+    String port = (envPort != null && envPort.matches("\\d+")) ? envPort : "50051";
 
-    // Build the gRPC server.
-    Server server =
-        ServerBuilder.forPort(port)
-            // Register our MessagingServiceImpl to handle RPC calls.
-            // We pass the registry so the service can manage connections.
-            .addService(new MessagingServiceImpl(registry))
-            .build()
-            .start();
+    // Inject the port into Spring Boot arguments
+    String[] normalizedArgs = new String[args.length + 1];
+    System.arraycopy(args, 0, normalizedArgs, 0, args.length);
+    normalizedArgs[args.length] = "--chat.grpc.port=" + port;
 
-    System.out.println("[server] started on port " + port);
+    logger.info("[server] starting on port {}", port);
 
-    // Add a shutdown hook to cleanly stop the server when the JVM shuts down (e.g., via Ctrl+C).
-    Runtime.getRuntime()
-        .addShutdownHook(
-            new Thread(
-                () -> {
-                  System.out.println("[server] shutting down");
-                  server.shutdown();
-                }));
-
-    // Keep the main thread alive while the server is running.
-    server.awaitTermination();
+    // Spring Boot becomes our "main loop", and the gRPC server is started by a bean.
+    SpringApplication.run(ChatServer.class, normalizedArgs);
   }
 }

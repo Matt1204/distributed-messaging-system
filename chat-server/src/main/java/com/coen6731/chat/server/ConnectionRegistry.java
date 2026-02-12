@@ -7,13 +7,19 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Component;
 
 /**
  * Manages active user connections.
  * It stores the mapping between user IDs and their response observers (streams).
  */
+@Component
 public class ConnectionRegistry {
-  private static final long HEARTBEAT_TIMEOUT_MS = 30000; // 30 seconds
+  private static final Logger logger = LoggerFactory.getLogger(ConnectionRegistry.class);
+  private static final long HEARTBEAT_TIMEOUT_MS = 25000; // 25 seconds
   private static final long CLEANUP_INTERVAL_MS = 5000;   // Check every 5 seconds
 
   // ConcurrentHashMap is used for thread-safe access since multiple threads (clients)
@@ -40,10 +46,11 @@ public class ConnectionRegistry {
   }
 
   /**
-   * Registers a user with their response stream.
+   * Registers an active stream session for a user.
    * If the user is already connected, the old connection is closed with an error.
+   * @return The newly created UserSession
    */
-  public void register(String userId, StreamObserver<ServerEvent> stream) {
+  public UserSession handleUserOnline(String userId, StreamObserver<ServerEvent> stream) {
     UserSession newSession = new UserSession(stream);
     UserSession oldSession = connectionsMap.put(userId, newSession);
 
@@ -51,13 +58,14 @@ public class ConnectionRegistry {
     if (oldSession != null && !Objects.equals(oldSession.getResponseObserver(), stream)) {
       oldSession.sendErrorAndClose("DUPLICATE_LOGIN", "A new session has replaced this connection");
     }
+    return newSession;
   }
 
   /**
    * Removes a user's connection.
    * Only removes if the current stream matches the one stored (to avoid removing a new session).
    */
-  public void unregister(String userId, StreamObserver<ServerEvent> stream) {
+  public void handleUserOffline(String userId, StreamObserver<ServerEvent> stream) {
     connectionsMap.computeIfPresent(
         userId,
         (key, current) -> {
@@ -85,7 +93,10 @@ public class ConnectionRegistry {
     long now = System.currentTimeMillis();
     connectionsMap.forEach((userId, userSession) -> {
       if (now - userSession.getLastHeartbeat() > HEARTBEAT_TIMEOUT_MS) {
-        System.out.println("[server] cleanup - removing inactive user:" + userId + ", last seen: " + (now - userSession.getLastHeartbeat()) + "ms ago");
+        logger.info(
+            "[server] cleanup - removing inactive user: {}, last seen: {}ms ago",
+            userId,
+            now - userSession.getLastHeartbeat());
 
         // Atomically remove if the userSession hasn't changed
         if (connectionsMap.remove(userId, userSession)) {
@@ -94,6 +105,13 @@ public class ConnectionRegistry {
       }
     });
 
-    System.out.println("[server] cleanup done - active sessions after cleanup: \n" + connectionsMap.keySet());
+    logger.debug(
+        "[server] cleanup done - active sessions after cleanup: {}",
+        connectionsMap.keySet());
+  }
+
+  @PreDestroy
+  public void shutdown() {
+    scheduler.shutdownNow();
   }
 }
