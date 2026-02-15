@@ -19,7 +19,7 @@ import org.springframework.stereotype.Component;
 @Component
 public class ConnectionRegistry {
   private static final Logger logger = LoggerFactory.getLogger(ConnectionRegistry.class);
-  private static final long HEARTBEAT_TIMEOUT_MS = 25000; // 25 seconds
+  private static final long HEARTBEAT_TIMEOUT_MS = 30000; // 30 seconds
   private static final long CLEANUP_INTERVAL_MS = 5000;   // Check every 5 seconds
 
   // ConcurrentHashMap is used for thread-safe access since multiple threads (clients)
@@ -99,15 +99,20 @@ public class ConnectionRegistry {
             now - userSession.getLastHeartbeat());
 
         // Atomically remove if the userSession hasn't changed
-        if (connectionsMap.remove(userId, userSession)) {
-          userSession.sendErrorAndClose("TIMEOUT", "User " + userId + " session timed out");
-        }
+        cleanupTimeoutUserSession(userId, userSession);
       }
     });
 
     logger.debug(
         "[server] cleanup done - active sessions after cleanup: {}",
         connectionsMap.keySet());
+  }
+
+  private void cleanupTimeoutUserSession(String userId, UserSession userSession) {
+    if (connectionsMap.remove(userId, userSession)) {
+      userSession.sendErrorAndClose("TIMEOUT", "User " + userId + " session timed out");
+    }
+
   }
 
   @PreDestroy
