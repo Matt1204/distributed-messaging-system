@@ -32,12 +32,15 @@ public class HeartbeatManager {
 
     public void start() {
         stop(); // Ensure no duplicates
+        // missedPongs.set(0);
         
+        // System.out.println("[client] Ping task started!");
         // Schedule Ping every 10 seconds
         heartbeatTask = scheduler.scheduleAtFixedRate(this::sendPing, 0, 10, TimeUnit.SECONDS);
     }
 
     public void stop() {
+        // System.out.println("[client] Stopping PING/PONG task...");
         if (heartbeatTask != null) {
             heartbeatTask.cancel(true);
             heartbeatTask = null;
@@ -49,10 +52,11 @@ public class HeartbeatManager {
     }
 
     public void handlePong() {
-        System.out.println("[client] received heartbeat Pong");
+        // System.out.println("[client] received heartbeat Pong");
         missedPongs.set(0);
         if (pongTimeoutTask != null) {
             pongTimeoutTask.cancel(false);
+            pongTimeoutTask = null;
         }
     }
 
@@ -64,11 +68,15 @@ public class HeartbeatManager {
                 // 1. Send Ping
                 HeartbeatPing ping = HeartbeatPing.newBuilder().setTs(Instant.now().toEpochMilli()).build();
                 observer.onNext(ClientEvent.newBuilder().setHeartbeatPing(ping).build());
-                System.out.println("[client] sent heartbeat Ping");
+                // System.out.println("[client] sent heartbeat Ping");
 
                 // if no Pong received in next 5 seconds, missed +1. if missed >= 3, server died, trigger reconnect process "reconnectCallback".
                 // if Pong received(handlePong), missed reset to 0.
-                pongTimeoutTask = scheduler.schedule(this::checkTimeout, 5, TimeUnit.SECONDS);
+                if (pongTimeoutTask != null) {
+                    pongTimeoutTask.cancel(false);
+                }
+                pongTimeoutTask = scheduler.schedule(this::handlePongTimeout, 5, TimeUnit.SECONDS);
+                // System.out.println("[client] Pong task started.");
             }
         } catch (Exception e) {
             System.out.println("[client] Heartbeat failed: " + e.getMessage());
@@ -76,12 +84,24 @@ public class HeartbeatManager {
         }
     }
 
-    private void checkTimeout() {
+    private void handlePongTimeout() {
         int missed = missedPongs.incrementAndGet();
-        System.out.println("[client] Pong timeout! Missed: " + missed + "/3");
+        System.out.println("[client] handlePongTimeout(), Missed: " + missed + "/3");
         if (missed >= 3) {
-            System.out.println("[client] 3 Strikes! Connection dead.");
+            System.out.println("[client] handlePongTimeout(), 3 Strikes! reconnect");
             reconnectCallback.run();
         }
+    }
+
+    public Boolean TaskIsRunning() {
+        return (heartbeatTask != null && !heartbeatTask.isCancelled()) || (pongTimeoutTask != null && !pongTimeoutTask.isCancelled());
+    }
+
+    public Boolean isThreeStrikes() {
+        return missedPongs.get() >= 3;
+    }
+
+    public void resetMissedPongs() {
+        missedPongs.set(0);
     }
 }
