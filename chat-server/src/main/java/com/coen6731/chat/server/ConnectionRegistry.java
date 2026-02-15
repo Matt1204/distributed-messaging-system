@@ -1,7 +1,9 @@
 package com.coen6731.chat.server;
 
+import com.coen6731.chat.ChatMessage;
 import com.coen6731.chat.ServerEvent;
 import io.grpc.stub.StreamObserver;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -28,8 +30,10 @@ public class ConnectionRegistry {
       new ConcurrentHashMap<>();
 
   private final ScheduledExecutorService scheduler;
+  private final RedisHandler redisHandler;
 
-  public ConnectionRegistry() {
+  public ConnectionRegistry(RedisHandler redisHandler) {
+    this.redisHandler = redisHandler;
     // Create a daemon thread for cleanup so it doesn't prevent JVM shutdown
     this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
       Thread t = new Thread(r, "connection-cleanup");
@@ -54,6 +58,9 @@ public class ConnectionRegistry {
     UserSession newSession = new UserSession(stream);
     UserSession oldSession = connectionsMap.put(userId, newSession);
 
+    // Register with Redis
+    redisHandler.registerUserOnline(userId, newSession.getSessionId());
+
     // If there was an existing connection and it's different from the new one, close the old one.
     if (oldSession != null && !Objects.equals(oldSession.getResponseObserver(), stream)) {
       oldSession.sendErrorAndClose("DUPLICATE_LOGIN", "A new session has replaced this connection");
@@ -71,6 +78,7 @@ public class ConnectionRegistry {
         (key, current) -> {
           // Only remove if the stored stream is the one requesting unregistration.
           if (Objects.equals(current.getResponseObserver(), stream)) {
+            redisHandler.removeUserOnline(userId); // Remove from Redis
             return null; // returning null removes the mapping
           }
           return current; // keep the current mapping
@@ -85,6 +93,7 @@ public class ConnectionRegistry {
     UserSession userSession = connectionsMap.get(userId);
     if (userSession != null) {
       userSession.updateHeartbeat();
+      redisHandler.renewUserOnline(userId); // Renew in Redis
     }
   }
 
@@ -110,9 +119,63 @@ public class ConnectionRegistry {
 
   private void cleanupTimeoutUserSession(String userId, UserSession userSession) {
     if (connectionsMap.remove(userId, userSession)) {
+      redisHandler.removeUserOnline(userId); // Remove from Redis
       userSession.sendErrorAndClose("TIMEOUT", "User " + userId + " session timed out");
     }
+  }
 
+  /**
+   * Delivers a message received from Redis Stream to the local user session.
+   * Called by RedisHandler consumer loop.
+   */
+  public void deliverRemoteMessage(String toUserId, String targetSessionId, Map<Object, Object> messageData) {
+      UserSession session = connectionsMap.get(toUserId);
+      if (session != null && session.getSessionId().equals(targetSessionId)) {
+          try {
+              String fromUserId = (String) messageData.get("fromUserId");
+              String chatPayload = (String) messageData.get("chatPayload"); // Assuming JSON or text
+              String messageId = (String) messageData.get("messageId");
+
+              // Reconstruct ChatMessage. 
+              // Note: In a real app, you might serialize/deserialize the full protobuf or JSON object.
+              // Here we assume simple text payload for the POC.
+              ChatMessage chatMessage = ChatMessage.newBuilder()
+                  .setFromUserId(fromUserId)
+                  .setText(chatPayload) // Assuming payload is the text
+                  .setServerMsgId(messageId)
+                  .setTs(System.currentTimeMillis()) // Or parse from message if available
+                  .build();
+
+              session.send(ServerEvent.newBuilder().setChatMessage(chatMessage).build());
+              logger.debug("[ConnectionRegistry] Delivered remote message to user {}", toUserId);
+          } catch (Exception e) {
+              logger.error("[ConnectionRegistry] Failed to deliver remote message to user {}", toUserId, e);
+          }
+      } else {
+          logger.debug("[ConnectionRegistry] Remote message target session mismatch or user offline: {}/{}", toUserId, targetSessionId);
+      }
+  }
+
+  /**
+   * Looks up routing information for a user.
+   * Returns "instanceId:sessionId" or null.
+   */
+  public String getRoutingInfo(String userId) {
+      return redisHandler.getUserOnlineInfo(userId);
+  }
+
+  /**
+   * Forwards a message to a target instance via Redis Stream.
+   */
+  public void ReplayMessageToNode(String targetInstanceId, String toUserId, String targetSessionId, ChatMessage message) {
+      Map<String, String> fields = new java.util.HashMap<>();
+      fields.put("toUserId", toUserId);
+      fields.put("fromUserId", message.getFromUserId());
+      fields.put("messageId", message.getServerMsgId());
+      fields.put("chatPayload", message.getText());
+      fields.put("targetSessionId", targetSessionId);
+      
+      redisHandler.publishRelayMessage(targetInstanceId, fields);
   }
 
   @PreDestroy

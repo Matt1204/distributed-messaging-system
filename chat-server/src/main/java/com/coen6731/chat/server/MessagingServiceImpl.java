@@ -131,13 +131,6 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
           return;
         }
 
-        UserSession targetSession = connectionRegistry.getSession(toUserId);
-        if (targetSession == null) {
-          logger.info("[server] handleSendMessage() - target user {} is offline", toUserId);
-          sendError(ERROR_USER_OFFLINE, "User " + toUserId + " is offline");
-          return;
-        }
-
         ChatMessage message =
             ChatMessage.newBuilder()
                 .setFromUserId(userId)
@@ -145,7 +138,32 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
                 .setServerMsgId(UUID.randomUUID().toString())
                 .setTs(Instant.now().toEpochMilli())
                 .build();
-        targetSession.send(ServerEvent.newBuilder().setChatMessage(message).build());
+        
+        // TODO: Add cosmos DB write logic here...
+
+        // 1. Try local delivery
+        UserSession localUserSession = connectionRegistry.getSession(toUserId);
+        if (localUserSession != null) {
+          logger.info("[server] handleSendMessage() - HIT local user: {}", cosmosDBHandler.getUserName(toUserId));
+          localUserSession.send(ServerEvent.newBuilder().setChatMessage(message).build());
+          return;
+        }
+
+        // 2. Try routing via Redis
+        String routingInfo = connectionRegistry.getRoutingInfo(toUserId);
+        if (routingInfo != null) {
+          String[] parts = routingInfo.split(":", 2);
+          if (parts.length == 2) {
+            String targetInstanceId = parts[0];
+            String targetSessionId = parts[1];
+            connectionRegistry.ReplayMessageToNode(targetInstanceId, toUserId, targetSessionId, message);
+            return;
+          }
+        }
+
+        // 3. User is offline
+        logger.info("[server] handleSendMessage() - target user {} is offline", toUserId);
+        sendError(ERROR_USER_OFFLINE, "User " + toUserId + " is offline");
       }
 
       private void handleHeartbeatPing(HeartbeatPing heartbeat) {
