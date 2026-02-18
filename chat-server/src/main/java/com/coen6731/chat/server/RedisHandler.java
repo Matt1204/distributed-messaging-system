@@ -119,13 +119,13 @@ public class RedisHandler {
      * Publishes a message to a target instance's stream.
      * Query: XADD stream:instance:{targetInstanceId} * field1 value1 field2 value2 ...
      */
-    public void publishRelayMessage(String targetInstanceId, Map<String, String> messageFields) {
+    public void publishRelayMessage(String targetInstanceId, Map<String, String> streamMsgRecord) {
         String streamKey = STREAM_KEY_PREFIX + targetInstanceId; // stream:instance:{targetInstanceId}
         // XADD appends a new entry to the stream. '*' means Redis generates the entry ID.
         redisTemplate.opsForStream().add(
             StreamRecords.newRecord()
                 .in(streamKey)
-                .ofMap(messageFields)
+                .ofMap(streamMsgRecord)
         );
         logger.debug("[RedisHandler] Published relay message to node: {}", streamKey);
     }
@@ -191,16 +191,17 @@ public class RedisHandler {
 
     private void processStreamMsgRecord(MapRecord<String, Object, Object> record) {
         try {
-            Map<Object, Object> value = record.getValue();
-            String toUserId = (String) value.get("toUserId");
-            String targetSessionId = (String) value.get("targetSessionId");
-            logger.info("[{}] [RedisHandler] Received message from user {} to user {} in target session {}", instanceId, (String) value.get("fromUserId"), toUserId, targetSessionId);
+            Map<Object, Object> streamMsgRecord = record.getValue();
+            String toUserId = (String) streamMsgRecord.get("toUserId");
+            String fromEmail = (String) streamMsgRecord.get("fromEmail");
+            String targetSessionId = (String) streamMsgRecord.get("targetSessionId");
+            logger.info("[{}] [RedisHandler] Received message from user {} to user {} in target session {}", instanceId, fromEmail, toUserId, targetSessionId);
             // Other fields available: fromUserId, messageId, chatPayload (JSON)
             
             if (toUserId != null && targetSessionId != null) {
-                connectionRegistry.deliverRemoteMessage(toUserId, targetSessionId, value);
+                connectionRegistry.deliverRemoteMessage(toUserId, targetSessionId, streamMsgRecord);
             } else {
-                logger.warn("[RedisHandler] Received malformed message: {}", value);
+                logger.warn("[RedisHandler] Received malformed message: {}", streamMsgRecord);
             }
         } catch (Exception e) {
             logger.error("[RedisHandler] Failed to process record {}", record.getId(), e);

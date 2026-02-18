@@ -32,6 +32,7 @@ message ServerEvent {
     ServerError serverError = 2;
     CatchupComplete catchupComplete = 3;
     HeartbeatPong heartbeatPong = 4;
+    AuthSuccess authSuccess = 5;
   }
 }
 
@@ -40,17 +41,18 @@ message ServerEvent {
 
 // notify server this user is available, add to connection registry.
 message LoginUser {
-  string userId = 1; // The user's ID.
+  string email = 1;
+  string password = 2;
 }
 
 // sned new user information to server, add to database.
 message RegisterUser {
-  string userId = 1; // The user's ID.
-  string userName = 2; // The user's name.
+  string email = 1;
+  string password = 2;
 }
 
 message SendMessage {
-  string toUserId = 1; // The recipient's user ID.
+  string toEmail = 1; // The recipient's email.
   string text = 2;     // The content of the message.
   string clientMsgId = 3; // A client-generated ID for tracking/deduplication.
 }
@@ -69,9 +71,10 @@ message Catchup {
 // server messages
 message ChatMessage {
   string fromUserId = 1; // The sender's user ID.
-  string text = 2;       // The message content.
-  string serverMsgId = 3; // Unique ID assigned by the server.
-  int64 ts = 4;          // Timestamp when the message was processed by the server.
+  string fromEmail = 2; // The sender's email.
+  string text = 3;       // The message content.
+  string serverMsgId = 4; // Unique ID assigned by the server.
+  int64 ts = 5;          // Timestamp when the message was processed by the server.
 }
 
 message ServerError {
@@ -86,4 +89,9 @@ message CatchupComplete {
 
 message HeartbeatPong {
   int64 ts = 1; // Timestamp of the heartbeat.
+}
+
+message AuthSuccess {
+  string userId = 1;
+  string email = 2;
 }

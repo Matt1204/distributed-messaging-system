@@ -15,6 +15,7 @@ public class DatabaseManager {
 
     public DatabaseManager(String dbPath) {
         this.dbUrl = "jdbc:sqlite:" + dbPath;
+        ensureSchema();
     }
 
     public static boolean databaseExists(String dbPath) {
@@ -44,6 +45,33 @@ public class DatabaseManager {
         }
     }
 
+    private void ensureSchema() {
+        try (Connection conn = DriverManager.getConnection(dbUrl);
+             Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE IF NOT EXISTS messages (sequence_id TEXT PRIMARY KEY, sender_id TEXT, content TEXT, created_at INTEGER)");
+            stmt.execute("CREATE TABLE IF NOT EXISTS user_state (user_id TEXT PRIMARY KEY, email TEXT, user_name TEXT, last_sync_sequence_id TEXT)");
+
+            if (!hasColumn(conn, "user_state", "email")) {
+                stmt.execute("ALTER TABLE user_state ADD COLUMN email TEXT");
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to ensure database schema: " + e.getMessage(), e);
+        }
+    }
+
+    private boolean hasColumn(Connection conn, String tableName, String columnName) throws SQLException {
+        try (PreparedStatement pstmt = conn.prepareStatement("PRAGMA table_info(" + tableName + ")");
+             ResultSet rs = pstmt.executeQuery()) {
+            while (rs.next()) {
+                String name = rs.getString("name");
+                if (columnName.equalsIgnoreCase(name)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     public void insertMessage(String sequenceId, String senderId, String content, long createdAt) {
         String sql = "INSERT OR IGNORE INTO messages(sequence_id, sender_id, content, created_at) VALUES(?, ?, ?, ?)";
         try (Connection conn = DriverManager.getConnection(dbUrl);
@@ -58,17 +86,30 @@ public class DatabaseManager {
         }
     }
 
-    public void updateUserState(String userId, String userName, String lastSyncSequenceId) {
-        String sql = "INSERT INTO user_state(user_id, user_name, last_sync_sequence_id) VALUES(?, ?, ?) " +
-                     "ON CONFLICT(user_id) DO UPDATE SET user_name=excluded.user_name, last_sync_sequence_id=excluded.last_sync_sequence_id";
+    public void updateUserState(String userId, String email, String lastSyncSequenceId) {
+        String sql = "INSERT INTO user_state(user_id, email, user_name, last_sync_sequence_id) VALUES(?, ?, ?, ?) " +
+                     "ON CONFLICT(user_id) DO UPDATE SET email=excluded.email, user_name=excluded.user_name, last_sync_sequence_id=excluded.last_sync_sequence_id";
         try (Connection conn = DriverManager.getConnection(dbUrl);
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
             pstmt.setString(1, userId);
-            pstmt.setString(2, userName);
-            pstmt.setString(3, lastSyncSequenceId);
+            pstmt.setString(2, email);
+            pstmt.setString(3, email);
+            pstmt.setString(4, lastSyncSequenceId);
             pstmt.executeUpdate();
         } catch (SQLException e) {
             System.err.println("Error updating user state: " + e.getMessage());
+        }
+    }
+
+    public void updateLastSyncSequenceId(String userId, String lastSyncSequenceId) {
+        String sql = "UPDATE user_state SET last_sync_sequence_id = ? WHERE user_id = ?";
+        try (Connection conn = DriverManager.getConnection(dbUrl);
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, lastSyncSequenceId);
+            pstmt.setString(2, userId);
+            pstmt.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Error updating last sync sequence id: " + e.getMessage());
         }
     }
 
@@ -97,6 +138,20 @@ public class DatabaseManager {
             }
         } catch (SQLException e) {
             System.err.println("Error getting last sync id: " + e.getMessage());
+        }
+        return null;
+    }
+
+    public String getEmail() {
+        String sql = "SELECT COALESCE(email, user_name) AS identity_email FROM user_state LIMIT 1";
+        try (Connection conn = DriverManager.getConnection(dbUrl);
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            ResultSet rs = pstmt.executeQuery();
+            if (rs.next()) {
+                return rs.getString("identity_email");
+            }
+        } catch (SQLException e) {
+            System.err.println("Error getting email: " + e.getMessage());
         }
         return null;
     }
