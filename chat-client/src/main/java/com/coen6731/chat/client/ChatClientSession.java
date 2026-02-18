@@ -12,6 +12,7 @@ import io.grpc.stub.MetadataUtils;
 import io.grpc.stub.StreamObserver;
 import java.util.UUID;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -29,8 +30,9 @@ public class ChatClientSession {
 
   private final AtomicBoolean isConnected = new AtomicBoolean(false);
   private final AtomicBoolean isReconnecting = new AtomicBoolean(false);
+  private final AtomicBoolean isClosing = new AtomicBoolean(false);
 
-  private int reconnectDelayMs = 1000;
+  private volatile int reconnectDelayMs = 1000;
   private static final int MAX_RECONNECT_DELAY_MS = 5000;
 
   public ChatClientSession(String target, String dbPath) {
@@ -57,11 +59,12 @@ public class ChatClientSession {
   }
 
   private synchronized void connect() {
+    if (isClosing.get()) return;
     // If already connected, do nothing
     if (isConnected.get()) return;
 
     try {
-      System.out.println("[client] Connecting to " + target + "...");
+      System.out.println("[client] connect(): Connecting to " + target + "...");
       
       ManagedChannelBuilder<?> builder = ManagedChannelBuilder.forTarget(target);
       if (target.endsWith(":443")) {
@@ -72,6 +75,7 @@ public class ChatClientSession {
       this.channel = builder.build();
 
       MessagingServiceGrpc.MessagingServiceStub stub = MessagingServiceGrpc.newStub(channel);
+      // System.out.println("[client] connect(): Created Stub");
 
       Metadata metadata = new Metadata();
       metadata.put(Metadata.Key.of("x-user-id", Metadata.ASCII_STRING_MARSHALLER), currentUserId);
@@ -82,25 +86,42 @@ public class ChatClientSession {
           dbManager, 
           heartbeatManager, 
           this::triggerReconnect, 
+          this::onConnectionHealthy,
           currentUserId
       );
-      
+      // System.out.println("[client] connect(): Created Response Handler");
+
       this.requestObserver = stub.chat(responseHandler);
-      
-      isConnected.set(true);
-      reconnectDelayMs = 1000; // Reset backoff on successful connection setup
+      // System.out.println("[client] connect(): Created Request Observer");
+
+      // Do NOT set isConnected=true here. Wait for first message/pong.
+      // Do NOT reset reconnectDelayMs here. Wait for healthy connection.
       
       heartbeatManager.start();
       // sendCatchup();
       
-      System.out.println("[client] Connected.");
+      System.out.println("[client] Connection initiated... waiting for server response.");
     } catch (Exception e) {
       System.out.println("[client] Connection setup failed: " + e.getMessage());
       triggerReconnect();
     }
   }
 
+  private void onConnectionHealthy() {
+    // System.out.println("[client] onConnectionHealthy()");
+    if (!isConnected.get()) {
+        isConnected.set(true);
+        // System.out.println("[client] Connection established and healthy.");
+    }
+    heartbeatManager.resetMissedPongs();
+    reconnectDelayMs = 1000;
+    // sendCatchup();
+  }
+
   private synchronized void triggerReconnect() {
+    if (isClosing.get()) {
+      return;
+    }
     if (isReconnecting.getAndSet(true)) {
         return; // Already reconnecting
     }
@@ -108,34 +129,43 @@ public class ChatClientSession {
     teardown();
     
     // Exponential backoff + Jitter
+    // range of delay: [reconnectDelayMs, MAX_RECONNECT_DELAY_MS]
     int jitter = (int)(Math.random() * 500);
     int delay = reconnectDelayMs + jitter;
     
     System.out.println("[client] Reconnecting in " + delay + "ms...");
-    
-    scheduler.schedule(() -> {
-        isReconnecting.set(false);
-        connect();
-    }, delay, TimeUnit.MILLISECONDS);
-    
-    reconnectDelayMs = Math.min(reconnectDelayMs * 2, MAX_RECONNECT_DELAY_MS);
+
+    try {
+      scheduler.schedule(() -> {
+          isReconnecting.set(false);
+          if (!isClosing.get()) {
+            connect();
+          }
+      }, delay, TimeUnit.MILLISECONDS);
+
+      reconnectDelayMs = Math.min(reconnectDelayMs * 2, MAX_RECONNECT_DELAY_MS);
+    } catch (RejectedExecutionException e) {
+      isReconnecting.set(false);
+      System.out.println("[client] Reconnect scheduling rejected: " + e.getMessage());
+    }
   }
 
   private void teardown() {
-    System.out.println("[client] Teardown (cleaning up resources)...");
+    // System.out.println("[client] teardown()");
     heartbeatManager.stop();
     
     isConnected.set(false);
+    // System.out.println("[client] teardown(), isConnected to false");
     
     if (requestObserver != null) {
         try { requestObserver.onCompleted(); } catch (Exception e) {}
         requestObserver = null;
     }
-    
     if (channel != null) {
         channel.shutdownNow();
         channel = null;
     }
+    // System.out.println("[client] teardown(): old connection teardown, done!");
   }
 
   public void sendMessage(String toUserId, String text) {
@@ -158,8 +188,9 @@ public class ChatClientSession {
 
   public void close() {
     System.out.println("[client] Closing session...");
-    scheduler.shutdownNow();
+    isClosing.set(true);
     teardown();
+    scheduler.shutdownNow();
   }
 
   public void sendRegisterUser(String userId, String userName) {

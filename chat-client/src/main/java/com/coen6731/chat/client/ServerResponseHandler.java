@@ -11,21 +11,25 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
     private final DatabaseManager dbManager;
     private final HeartbeatManager heartbeatManager;
     private final Runnable reconnectCallback;
+    private final Runnable onConnectionHealthy;
     private final String currentUserId;
 
     public ServerResponseHandler(
             DatabaseManager dbManager,
             HeartbeatManager heartbeatManager,
             Runnable reconnectCallback,
+            Runnable onConnectionHealthy,
             String currentUserId) {
         this.dbManager = dbManager;
         this.heartbeatManager = heartbeatManager;
         this.reconnectCallback = reconnectCallback;
+        this.onConnectionHealthy = onConnectionHealthy;
         this.currentUserId = currentUserId;
     }
 
     @Override
     public void onNext(ServerEvent value) {
+        onConnectionHealthy.run();
         switch (value.getPayloadCase()) {
             case CHATMESSAGE:
                 handleChatMessage(value.getChatMessage());
@@ -49,15 +53,20 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
             StatusRuntimeException sre = (StatusRuntimeException) t;
             Status status = sre.getStatus();
             if (status.getCode() == Status.Code.UNAVAILABLE || status.getCode() == Status.Code.CANCELLED) {
-                System.out.println("[client] Server unavailable/disconnected: " + status.getCode());
+                System.out.println("[client] OnError(), Server code: " + status.getCode());
             } else {
-                System.out.println("[client] Stream error: " + status);
+                System.out.println("[client] OnError(), Stream error: " + status);
             }
         } else {
-            System.out.println("[client] Stream error: " + t.getMessage());
+            System.out.println("[client] OnError " + t.getMessage());
         }
-        // Trigger reconnect on error
-        reconnectCallback.run();
+
+        if (heartbeatManager.isThreeStrikes()) {
+            System.out.println("[client] OnError(), already 3 strikes, calling Recconect immediately !!!");
+            reconnectCallback.run();
+        } else {
+            System.out.println("[client] OnError(), not 3 strikes, wait next ping...");
+        }
     }
 
     @Override

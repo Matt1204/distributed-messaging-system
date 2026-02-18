@@ -1,0 +1,24 @@
+# Production / Cloud Configuration
+azure:
+  cosmos:
+    endpoint: ${COSMOS_ENDPOINT}
+    key: ${COSMOS_KEY}
+    database: ${COSMOS_DATABASE}
+
+container:
+  app:
+    replica:
+      name: ${CONTAINER_APP_REPLICA_NAME}
+
+chat:
+  grpc:
+    port: ${PORT:50051}
+
+spring:
+  data:
+    redis:
+      host: ${REDIS_HOST}
+      port: ${REDIS_PORT}
+      password: ${REDIS_PASSWORD}
+      ssl:
+        enabled: true

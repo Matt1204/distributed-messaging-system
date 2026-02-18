@@ -13,11 +13,17 @@ import org.slf4j.LoggerFactory;
 public class UserSession {
   private static final Logger logger = LoggerFactory.getLogger(UserSession.class);
   private final StreamObserver<ServerEvent> responseObserver;
+  private final String sessionId;
   private volatile long lastHeartbeat;
 
   public UserSession(StreamObserver<ServerEvent> responseObserver) {
     this.responseObserver = responseObserver;
+    this.sessionId = java.util.UUID.randomUUID().toString();
     this.lastHeartbeat = System.currentTimeMillis();
+  }
+
+  public String getSessionId() {
+    return sessionId;
   }
 
   public StreamObserver<ServerEvent> getResponseObserver() {

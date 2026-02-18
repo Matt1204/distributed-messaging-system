@@ -31,7 +31,8 @@ USER spring:spring
 # We use the specific name to avoid ambiguity
 COPY --from=build /app/chat-server/target/chat-server-1.0-SNAPSHOT.jar app.jar
 
-ENV CHAT_GRPC_PORT=50051
+ENV SPRING_PROFILES_ACTIVE=prod
+ENV PORT=50051
 EXPOSE 50051
 
-ENTRYPOINT ["java", "-jar", "app.jar"]
+ENTRYPOINT ["java", "-Dserver.port=${PORT}", "-jar", "app.jar"]

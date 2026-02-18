@@ -6,9 +6,9 @@ import com.azure.cosmos.CosmosContainer;
 import com.azure.cosmos.CosmosDatabase;
 import com.azure.cosmos.models.CosmosItemResponse;
 import com.azure.cosmos.models.PartitionKey;
-import io.github.cdimascio.dotenv.Dotenv;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import javax.annotation.PostConstruct;
@@ -20,6 +20,18 @@ import java.util.Map;
 public class CosmosDBHandler {
     private static final Logger logger = LoggerFactory.getLogger(CosmosDBHandler.class);
 
+    @Value("${azure.cosmos.endpoint}")
+    private String endpoint;
+
+    @Value("${azure.cosmos.key}")
+    private String key;
+
+    @Value("${azure.cosmos.database}")
+    private String databaseName;
+
+    @Value("${container.app.replica.name}")
+    private String replicaName;
+
     private CosmosClient client;
     private CosmosDatabase database;
     private CosmosContainer usersContainer;
@@ -28,23 +40,15 @@ public class CosmosDBHandler {
     @PostConstruct
     public void init() {
         try {
-            Dotenv dotenv = Dotenv.configure()
-                    .directory("./chat-server")
-                    .ignoreIfMissing()
-                    .load();
-
-            String endpoint = dotenv.get("COSMOS_ENDPOINT");
-            String key = dotenv.get("COSMOS_KEY");
-            String databaseName = dotenv.get("COSMOS_DATABASE", "ChatDB");
-
-            if (endpoint == null || key == null) {
-                logger.error("Cosmos DB credentials not found in .env file");
+            if (endpoint == null || endpoint.isEmpty() || key == null || key.isEmpty()) {
+                logger.error("Cosmos DB credentials not found in configuration");
                 return;
             }
 
             logger.info("Initializing Cosmos DB connection...");
             logger.info("Connection Endpoint: {}", endpoint);
             logger.info("Database Name: {}", databaseName);
+            logger.info("Container App Replica Name: {}", replicaName);
 
             client = new CosmosClientBuilder()
                     .endpoint(endpoint)
@@ -79,9 +83,9 @@ public class CosmosDBHandler {
 
         try {
             CosmosItemResponse<Map> response = usersContainer.upsertItem(userItem, new PartitionKey(userId), null);
-            logger.info("User registered/updated in Cosmos DB: userId={}, statusCode={}", userId, response.getStatusCode());
+            logger.info("User registered/updated in Cosmos DB: userName={}, userId={}, statusCode={}", userName, userId, response.getStatusCode());
         } catch (Exception e) {
-            logger.error("Failed to register user in Cosmos DB: userId={}", userId, e);
+            logger.error("Failed to register user in Cosmos DB: userName={}, userId={}", userName, userId, e);
         }
     }
 

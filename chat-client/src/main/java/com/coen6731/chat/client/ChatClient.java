@@ -17,7 +17,7 @@ public class ChatClient {
     if (target == null) {
       target = System.getenv("TARGET");
     }
-    
+     
     BufferedReader reader = new BufferedReader(new InputStreamReader(System.in));
 
     String dbPath = askDbPath(reader);

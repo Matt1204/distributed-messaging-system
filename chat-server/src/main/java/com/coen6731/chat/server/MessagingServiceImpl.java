@@ -30,6 +30,9 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
   private final ConnectionRegistry connectionRegistry;
   private final CosmosDBHandler cosmosDBHandler;
 
+  @org.springframework.beans.factory.annotation.Value("${container.app.replica.name}")
+  private String serverReplicaId;
+
   public MessagingServiceImpl(ConnectionRegistry registry, CosmosDBHandler cosmosDBHandler) {
     this.connectionRegistry = registry;
     this.cosmosDBHandler = cosmosDBHandler;
@@ -79,16 +82,16 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
       public void onError(Throwable t) {
         Status status = Status.fromThrowable(t);
         if (status.getCode() == Status.Code.CANCELLED) {
-          logger.info("[server] client disconnected (cancelled stream)");
+          logger.info("[{}] client disconnected (cancelled stream)", serverReplicaId);
         } else {
-          logger.warn("[server] onError() - stream error: {}", status);
+          logger.warn("[{}] onError() - stream error: {}", serverReplicaId, status);
         }
         cleanup();
       }
 
       @Override
       public void onCompleted() {
-        logger.info("[server] onCompleted() - stream completed");
+        logger.info("[{}] onCompleted() - stream completed", serverReplicaId);
         cleanup();
         session.close();
       }
@@ -102,39 +105,47 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
           return true;
         }
 
-        logger.warn("[server] onNext() - user {} is not registered.", userId);
+        logger.warn("[{}] onNext() - user {} is not registered.", serverReplicaId, userId);
         sendError(
             ERROR_NOT_REGISTERED,
             "User " + userId + " is not registered. Please register first.");
         return false;
       }
 
-      // Handlers for different client events
-
+      /**
+      handle the "registerUser" event.
+      1. add user record to cosmos DB.
+      2. make user "online" in connection registry.
+      */
       private void handleRegisterUser(RegisterUser registerUser) {
         String userName = registerUser.getUserName();
         cosmosDBHandler.registerUser(userId, userName);
 
+        // when user first registered, move user to "online" in connection registry.
         if (!isRegistered) {
           isRegistered = true;
           // Transition from temporary stream session to tracked registry session.
           session = connectionRegistry.handleUserOnline(userId, responseObserver);
-          logger.info("[server] registered and activated session for userId={}", userId);
+          logger.info("[{}] registered and activated session for userName={}", serverReplicaId, userName);
         }
       }
 
+      /**
+       * Handler for SendMessage event.
+       * 
+       * Handle the event when cllient wants to send a message to another user.
+       * 1. parse message
+       * 2. check local connection registry to find the target user session. if found, send message.
+       * 3. check redis global connection registry, if found use redis stream to relay message to target instance.
+       * 4. if not found, user is offline
+       * @param sendMessage
+       * 
+       */
       private void handleSendMessage(SendMessage sendMessage) {
         String toUserId = sendMessage.getToUserId();
         if (toUserId == null || toUserId.isBlank()) {
-          logger.warn("[server] handleSendMessage() - toUserId is null or blank");
+          logger.warn("[{}] handleSendMessage() - toUserId is null or blank", serverReplicaId);
           sendError(ERROR_BAD_REQUEST, "toUserId is required");
-          return;
-        }
-
-        UserSession targetSession = connectionRegistry.getSession(toUserId);
-        if (targetSession == null) {
-          logger.info("[server] handleSendMessage() - target user {} is offline", toUserId);
-          sendError(ERROR_USER_OFFLINE, "User " + toUserId + " is offline");
           return;
         }
 
@@ -145,11 +156,37 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
                 .setServerMsgId(UUID.randomUUID().toString())
                 .setTs(Instant.now().toEpochMilli())
                 .build();
-        targetSession.send(ServerEvent.newBuilder().setChatMessage(message).build());
+        
+        // TODO: Add cosmos DB write logic here. always write to cosmos first.
+
+        // 1. Try local delivery
+        UserSession localUserSession = connectionRegistry.getSession(toUserId);
+        if (localUserSession != null) {
+          logger.info("[{}] handleSendMessage() - HIT local user: userName={}", serverReplicaId, cosmosDBHandler.getUserName(toUserId));
+          localUserSession.send(ServerEvent.newBuilder().setChatMessage(message).build());
+          return;
+        }
+
+        // 2. Try routing via Redis
+        String routingInfo = connectionRegistry.getRoutingInfo(toUserId);
+        if (routingInfo != null) {
+          String[] parts = routingInfo.split(":", 2);
+          if (parts.length == 2) {
+            String targetInstanceId = parts[0];
+            String targetSessionId = parts[1];
+            logger.info("[{}] handleSendMessage() - RELAY message to user {} in target instance (targetInstanceId={}, targetSessionId={})", serverReplicaId, cosmosDBHandler.getUserName(toUserId), targetInstanceId, targetSessionId);
+            connectionRegistry.ReplayMessageToNode(targetInstanceId, toUserId, targetSessionId, message);
+            return;
+          }
+        }
+
+        // TODO: should be silent, it's not error.
+        logger.info("[{}] handleSendMessage() - target user userName={} is offline", serverReplicaId, cosmosDBHandler.getUserName(toUserId));
+        // sendError(ERROR_USER_OFFLINE, "User " + toUserId + " is offline");
       }
 
       private void handleHeartbeatPing(HeartbeatPing heartbeat) {
-        logger.debug("[server] handleHeartbeatPing() - received heartbeat Ping from {}", userId);
+        logger.debug("[{}] handleHeartbeatPing() - received heartbeat Ping from session: {}", serverReplicaId, session.getSessionId());
         connectionRegistry.updateHeartbeat(userId);
 
         HeartbeatPong pong = HeartbeatPong.newBuilder().setTs(Instant.now().toEpochMilli()).build();
@@ -164,7 +201,7 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
       private void cleanup() {
         if (isRegistered) {
           connectionRegistry.handleUserOffline(userId, responseObserver);
-          logger.info("[server] unregistered userId={}", userId);
+          logger.info("[{}] unregistered userId={}", serverReplicaId, userId);
         }
       }
     };
@@ -172,9 +209,9 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
 
   private void logConnectionState(String userId, boolean userExists) {
     if (userExists) {
-      logger.info("[server] connected userId={}", userId);
+      logger.info("[{}] connected user: {}, userId={}", serverReplicaId, cosmosDBHandler.getUserName(userId), userId);
     } else {
-      logger.info("[server] new connection from unregistered userId={}", userId);
+      logger.info("[{}] new connection from un-registered userId={}", serverReplicaId, userId);
     }
   }
 }
