@@ -209,9 +209,9 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
 
   private void logConnectionState(String userId, boolean userExists) {
     if (userExists) {
-      logger.info("[{}] connected userId={}", serverReplicaId, userId);
+      logger.info("[{}] connected user: {}, userId={}", serverReplicaId, cosmosDBHandler.getUserName(userId), userId);
     } else {
-      logger.info("[{}] new connection from unregistered userId={}", serverReplicaId, userId);
+      logger.info("[{}] new connection from un-registered userId={}", serverReplicaId, userId);
     }
   }
 }

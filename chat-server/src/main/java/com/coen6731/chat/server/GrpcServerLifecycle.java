@@ -23,6 +23,9 @@ public class GrpcServerLifecycle implements SmartLifecycle {
   private Server server;
   private Thread awaitThread;
 
+  @org.springframework.beans.factory.annotation.Value("${container.app.replica.name}")
+  private String serverReplicaId;
+
   public GrpcServerLifecycle(
       MessagingServiceImpl messagingService,
       @Value("${chat.grpc.port}") int port) {
@@ -43,7 +46,7 @@ public class GrpcServerLifecycle implements SmartLifecycle {
               .intercept(new UserIdInterceptor())
               .build()
               .start();
-      logger.info("[server] started on port {}", port);
+      logger.info("[{}] [GrpcServerLifecycle] started on port {}", serverReplicaId, port);
 
       // Spring Boot will exit if only daemon threads are running.
       // gRPC's internal threads are daemon by default, so we keep a non-daemon
@@ -83,11 +86,11 @@ public class GrpcServerLifecycle implements SmartLifecycle {
           server.shutdownNow();
       }
     } catch (InterruptedException e) {
-      logger.warn("[server] interrupted during shutdown, forcing shutdown.");
+      logger.warn("[{}] [GrpcServerLifecycle] interrupted during shutdown, forcing shutdown.", serverReplicaId);
       server.shutdownNow();
       Thread.currentThread().interrupt();
     } finally {
-      logger.info("[server] gRPC server stopped.");
+      logger.info("[{}] [GrpcServerLifecycle] gRPC server stopped.", serverReplicaId);
       if (awaitThread != null) {
         awaitThread.interrupt();
       }

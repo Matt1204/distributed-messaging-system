@@ -75,13 +75,12 @@ public class ConnectionRegistry {
   public void handleUserOffline(String userId, StreamObserver<ServerEvent> stream) {
     connectionsMap.computeIfPresent(
         userId,
-        (key, current) -> {
-          // Only remove if the stored stream is the one requesting unregistration.
-          if (Objects.equals(current.getResponseObserver(), stream)) {
+        (key, currentUserSession) -> {
+          if (Objects.equals(currentUserSession.getResponseObserver(), stream)) {
             redisHandler.removeUserOnline(userId); // Remove from Redis
-            return null; // returning null removes the mapping
+            return null; // returning null to remove the mapping
           }
-          return current; // keep the current mapping
+          return currentUserSession; // keep the current mapping
         });
   }
 
