@@ -157,7 +157,7 @@ public class ConnectionRegistry {
   }
 
   /**
-   * Looks up routing information for a user.
+   * Looks up global connection registry for a user.
    * Returns "instanceId:sessionId" or null.
    */
   public String getRoutingInfo(String userId) {

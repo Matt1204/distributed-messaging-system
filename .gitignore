@@ -15,8 +15,6 @@
 
 .env
 **/.env
-application-dev.yml
-**/application-dev.yml
 
 ## OS files
 .DS_Store

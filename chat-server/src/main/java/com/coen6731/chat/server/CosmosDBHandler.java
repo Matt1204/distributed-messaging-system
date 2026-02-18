@@ -83,9 +83,9 @@ public class CosmosDBHandler {
 
         try {
             CosmosItemResponse<Map> response = usersContainer.upsertItem(userItem, new PartitionKey(userId), null);
-            logger.info("User registered/updated in Cosmos DB: userId={}, statusCode={}", userId, response.getStatusCode());
+            logger.info("User registered/updated in Cosmos DB: userName={}, userId={}, statusCode={}", userName, userId, response.getStatusCode());
         } catch (Exception e) {
-            logger.error("Failed to register user in Cosmos DB: userId={}", userId, e);
+            logger.error("Failed to register user in Cosmos DB: userName={}, userId={}", userName, userId, e);
         }
     }
 

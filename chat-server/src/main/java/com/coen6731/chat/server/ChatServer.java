@@ -18,6 +18,7 @@ public class ChatServer {
         .load();
     dotenv.entries().forEach(entry -> {
       if (System.getProperty(entry.getKey()) == null && System.getenv(entry.getKey()) == null) {
+        // System.out.println("Setting property: " + entry.getKey() + " = " + entry.getValue());
         System.setProperty(entry.getKey(), entry.getValue());
       }
     });

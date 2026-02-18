@@ -194,7 +194,7 @@ public class RedisHandler {
             Map<Object, Object> value = record.getValue();
             String toUserId = (String) value.get("toUserId");
             String targetSessionId = (String) value.get("targetSessionId");
-            
+            logger.info("[{}] [RedisHandler] Received message from user {} to user {} in target session {}", instanceId, (String) value.get("fromUserId"), toUserId, targetSessionId);
             // Other fields available: fromUserId, messageId, chatPayload (JSON)
             
             if (toUserId != null && targetSessionId != null) {

@@ -25,7 +25,7 @@ public class GrpcServerLifecycle implements SmartLifecycle {
 
   public GrpcServerLifecycle(
       MessagingServiceImpl messagingService,
-      @Value("${chat.grpc.port:50051}") int port) {
+      @Value("${chat.grpc.port}") int port) {
     this.messagingService = messagingService;
     this.port = port;
   }
