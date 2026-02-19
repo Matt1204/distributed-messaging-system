@@ -6,7 +6,6 @@ import io.grpc.Metadata;
 import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
-import io.grpc.Status;
 
 public class UserIdInterceptor implements ServerInterceptor {
   // Define a key to access the value in the Context later
@@ -21,12 +20,7 @@ public class UserIdInterceptor implements ServerInterceptor {
     // Read the header
     String userId = headers.get(Metadata.Key.of("x-user-id", Metadata.ASCII_STRING_MARSHALLER));
 
-    if (userId == null || userId.isBlank()) {
-      call.close(Status.UNAUTHENTICATED.withDescription("Missing x-user-id header"), headers);
-      return new ServerCall.Listener<>() {};
-    }
-
-    // Put it into the Context so the Service can see it
+    // Allow anonymous stream setup. Authentication is enforced at event handling level.
     Context context = Context.current().withValue(USER_ID_CTX_KEY, userId);
     return Contexts.interceptCall(context, call, headers, next);
   }

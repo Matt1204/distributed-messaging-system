@@ -1,21 +1,26 @@
 package com.coen6731.chat.server;
 
+import com.coen6731.chat.AuthSuccess;
+import com.coen6731.chat.ChatMessage;
 import com.coen6731.chat.ClientEvent;
-import com.coen6731.chat.RegisterUser;
-import com.coen6731.chat.ServerError;
 import com.coen6731.chat.HeartbeatPing;
 import com.coen6731.chat.HeartbeatPong;
-import com.coen6731.chat.ChatMessage;
+import com.coen6731.chat.LoginUser;
 import com.coen6731.chat.MessagingServiceGrpc;
+import com.coen6731.chat.RegisterUser;
 import com.coen6731.chat.SendMessage;
+import com.coen6731.chat.ServerError;
 import com.coen6731.chat.ServerEvent;
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import java.time.Instant;
+import java.util.Optional;
 import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Component;
-import io.grpc.Status;
 
 /**
  * Implementation of the MessagingService defined in the proto file.
@@ -23,12 +28,15 @@ import io.grpc.Status;
 @Component
 public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceImplBase {
   private static final Logger logger = LoggerFactory.getLogger(MessagingServiceImpl.class);
-  private static final String ERROR_NOT_REGISTERED = "NOT_REGISTERED";
   private static final String ERROR_BAD_REQUEST = "BAD_REQUEST";
-  private static final String ERROR_USER_OFFLINE = "USER_OFFLINE";
+  private static final String ERROR_AUTH_NOT_AUTHENTICATED = "AUTH_NOT_AUTHENTICATED";
+  private static final String ERROR_AUTH_INVALID_CREDENTIALS = "AUTH_INVALID_CREDENTIALS";
+  private static final String ERROR_AUTH_EMAIL_ALREADY_EXISTS = "AUTH_EMAIL_ALREADY_EXISTS";
+  private static final String ERROR_INTERNAL = "INTERNAL";
 
   private final ConnectionRegistry connectionRegistry;
   private final CosmosDBHandler cosmosDBHandler;
+  private final PasswordEncoder passwordEncoder;
 
   @org.springframework.beans.factory.annotation.Value("${container.app.replica.name}")
   private String serverReplicaId;
@@ -36,21 +44,34 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
   public MessagingServiceImpl(ConnectionRegistry registry, CosmosDBHandler cosmosDBHandler) {
     this.connectionRegistry = registry;
     this.cosmosDBHandler = cosmosDBHandler;
+    this.passwordEncoder = new BCryptPasswordEncoder();
   }
 
   @Override
   public StreamObserver<ClientEvent> chat(StreamObserver<ServerEvent> responseObserver) {
-    final String userId = UserIdInterceptor.USER_ID_CTX_KEY.get();
-    boolean userInDB = cosmosDBHandler.userExistsInDB(userId);
-    logConnectionState(userId, userInDB);
+    final String headerUserId = UserIdInterceptor.USER_ID_CTX_KEY.get();
+    final Optional<CosmosDBHandler.UserRecord> UserRecordFromHeader =
+        (headerUserId == null || headerUserId.isBlank())
+            ? Optional.empty()
+            : cosmosDBHandler.findUserByUserId(headerUserId);
 
-    UserSession initialSession =
-        userInDB
-            ? connectionRegistry.handleUserOnline(userId, responseObserver)
-            : new UserSession(responseObserver);
+    final UserSession initialSession;
+    if (UserRecordFromHeader.isPresent()) {
+      initialSession = connectionRegistry.handleUserOnline(UserRecordFromHeader.get().userId(), responseObserver);
+      logger.info(
+          "[{}] stream started as authenticated userId={}, email={}",
+          serverReplicaId,
+          UserRecordFromHeader.get().userId(),
+          UserRecordFromHeader.get().email());
+    } else {
+      initialSession = new UserSession(responseObserver);
+      logger.info("[{}] stream started in UNAUTHENTICATED state", serverReplicaId);
+    }
 
     return new StreamObserver<ClientEvent>() {
-      private boolean isRegistered = userInDB;
+      private boolean isAuthenticated = UserRecordFromHeader.isPresent();
+      private String effectiveUserId = UserRecordFromHeader.map(CosmosDBHandler.UserRecord::userId).orElse(null);
+      private String effectiveEmail = UserRecordFromHeader.map(CosmosDBHandler.UserRecord::email).orElse(null);
       private UserSession session = initialSession;
 
       @Override
@@ -60,20 +81,31 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
           return;
         }
 
-        if (!canProcess(event)) {
-          return;
-        }
-
         switch (event.getPayloadCase()) {
+          case LOGINUSER:
+            if (isAuthenticated) {
+              sendError(ERROR_BAD_REQUEST, "Already authenticated");
+              return;
+            }
+            handleLoginUser(event.getLoginUser());
+            break;
           case REGISTERUSER:
+            if (isAuthenticated) {
+              sendError(ERROR_BAD_REQUEST, "Already authenticated");
+              return;
+            }
             handleRegisterUser(event.getRegisterUser());
             break;
           case SENDMESSAGE:
+            if (!isAuthenticated) {
+              sendError(ERROR_AUTH_NOT_AUTHENTICATED, "Authenticate with login/register first");
+              return;
+            }
             handleSendMessage(event.getSendMessage());
             break;
           case PAYLOAD_NOT_SET:
           default:
-            sendError(ERROR_BAD_REQUEST, "Empty client event");
+            sendError(ERROR_BAD_REQUEST, "Empty or unsupported client event");
             break;
         }
       }
@@ -100,69 +132,106 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
         return event.getPayloadCase() == ClientEvent.PayloadCase.HEARTBEATPING;
       }
 
-      private boolean canProcess(ClientEvent event) {
-        if (isRegistered || event.getPayloadCase() == ClientEvent.PayloadCase.REGISTERUSER) {
-          return true;
+      private void handleLoginUser(LoginUser loginUser) {
+        String email = normalizeEmail(loginUser.getEmail());
+        String password = loginUser.getPassword();
+        if (email.isBlank() || password == null || password.isBlank()) {
+          sendError(ERROR_BAD_REQUEST, "email and password are required");
+          return;
         }
 
-        logger.warn("[{}] onNext() - user {} is not registered.", serverReplicaId, userId);
-        sendError(
-            ERROR_NOT_REGISTERED,
-            "User " + userId + " is not registered. Please register first.");
-        return false;
+        Optional<CosmosDBHandler.UserRecord> found = cosmosDBHandler.findUserByEmail(email);
+        if (found.isEmpty() || found.get().passwordHash() == null) {
+          sendError(ERROR_AUTH_INVALID_CREDENTIALS, "Invalid email or password");
+          return;
+        }
+
+        if (!passwordEncoder.matches(password, found.get().passwordHash())) {
+          sendError(ERROR_AUTH_INVALID_CREDENTIALS, "Invalid email or password");
+          return;
+        }
+
+        activateAuthenticatedSession(found.get().userId(), found.get().email());
       }
 
-      /**
-      handle the "registerUser" event.
-      1. add user record to cosmos DB.
-      2. make user "online" in connection registry.
-      */
       private void handleRegisterUser(RegisterUser registerUser) {
-        String userName = registerUser.getUserName();
-        cosmosDBHandler.registerUser(userId, userName);
-
-        // when user first registered, move user to "online" in connection registry.
-        if (!isRegistered) {
-          isRegistered = true;
-          // Transition from temporary stream session to tracked registry session.
-          session = connectionRegistry.handleUserOnline(userId, responseObserver);
-          logger.info("[{}] registered and activated session for userName={}", serverReplicaId, userName);
+        String email = normalizeEmail(registerUser.getEmail());
+        String password = registerUser.getPassword();
+        if (email.isBlank() || password == null || password.isBlank()) {
+          sendError(ERROR_BAD_REQUEST, "email and password are required");
+          return;
         }
+
+        if (cosmosDBHandler.findUserByEmail(email).isPresent()) {
+          sendError(ERROR_AUTH_EMAIL_ALREADY_EXISTS, "Email is already registered");
+          return;
+        }
+
+        String passwordHash = passwordEncoder.encode(password);
+        Optional<CosmosDBHandler.UserRecord> created = cosmosDBHandler.createUser(email, passwordHash);
+        if (created.isEmpty()) {
+          sendError(ERROR_INTERNAL, "Failed to create user");
+          return;
+        }
+
+        activateAuthenticatedSession(created.get().userId(), created.get().email());
+      }
+
+      private void activateAuthenticatedSession(String userId, String email) {
+        isAuthenticated = true;
+        effectiveUserId = userId;
+        effectiveEmail = email;
+        session = connectionRegistry.handleUserOnline(userId, responseObserver);
+
+        AuthSuccess authSuccess =
+            AuthSuccess.newBuilder().setUserId(userId).setEmail(email == null ? "" : email).build();
+        session.send(ServerEvent.newBuilder().setAuthSuccess(authSuccess).build());
+        logger.info("[{}] authenticated userId={}, email={}", serverReplicaId, userId, email);
       }
 
       /**
        * Handler for SendMessage event.
-       * 
-       * Handle the event when cllient wants to send a message to another user.
+       *
+       * Handle the event when client wants to send a message to another user.
        * 1. parse message
        * 2. check local connection registry to find the target user session. if found, send message.
        * 3. check redis global connection registry, if found use redis stream to relay message to target instance.
        * 4. if not found, user is offline
-       * @param sendMessage
-       * 
        */
       private void handleSendMessage(SendMessage sendMessage) {
-        String toUserId = sendMessage.getToUserId();
-        if (toUserId == null || toUserId.isBlank()) {
-          logger.warn("[{}] handleSendMessage() - toUserId is null or blank", serverReplicaId);
-          sendError(ERROR_BAD_REQUEST, "toUserId is required");
+        String toEmail = sendMessage.getToEmail();
+        if (toEmail == null || toEmail.isBlank()) {
+          logger.warn("[{}] handleSendMessage() - toEmail is null or blank", serverReplicaId);
+          sendError(ERROR_BAD_REQUEST, "toEmail is required");
           return;
         }
 
+        Optional<CosmosDBHandler.UserRecord> toUserRecord = cosmosDBHandler.findUserByEmail(toEmail);
+        if (toUserRecord.isEmpty()) {
+          logger.warn("[{}] handleSendMessage() - toEmail={} not found in cosmos DB", serverReplicaId, toEmail);
+          sendError(ERROR_BAD_REQUEST, "toEmail=" + toEmail + " not found");
+          return;
+        }
+        String toUserId = toUserRecord.get().userId();
+
         ChatMessage message =
             ChatMessage.newBuilder()
-                .setFromUserId(userId)
+                .setFromUserId(effectiveUserId)
                 .setText(sendMessage.getText())
+                .setFromEmail(effectiveEmail)
                 .setServerMsgId(UUID.randomUUID().toString())
                 .setTs(Instant.now().toEpochMilli())
                 .build();
-        
+
         // TODO: Add cosmos DB write logic here. always write to cosmos first.
 
         // 1. Try local delivery
         UserSession localUserSession = connectionRegistry.getSession(toUserId);
         if (localUserSession != null) {
-          logger.info("[{}] handleSendMessage() - HIT local user: userName={}", serverReplicaId, cosmosDBHandler.getUserName(toUserId));
+          logger.info(
+              "[{}] handleSendMessage() - HIT local user: email={}",
+              serverReplicaId,
+              toEmail);
           localUserSession.send(ServerEvent.newBuilder().setChatMessage(message).build());
           return;
         }
@@ -174,20 +243,32 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
           if (parts.length == 2) {
             String targetInstanceId = parts[0];
             String targetSessionId = parts[1];
-            logger.info("[{}] handleSendMessage() - RELAY message to user {} in target instance (targetInstanceId={}, targetSessionId={})", serverReplicaId, cosmosDBHandler.getUserName(toUserId), targetInstanceId, targetSessionId);
+            logger.info(
+                "[{}] handleSendMessage() - RELAY message to user {} in target instance (targetInstanceId={}, targetSessionId={})",
+                serverReplicaId,
+                toEmail,
+                targetInstanceId,
+                targetSessionId);
             connectionRegistry.ReplayMessageToNode(targetInstanceId, toUserId, targetSessionId, message);
             return;
           }
         }
 
-        // TODO: should be silent, it's not error.
-        logger.info("[{}] handleSendMessage() - target user userName={} is offline", serverReplicaId, cosmosDBHandler.getUserName(toUserId));
-        // sendError(ERROR_USER_OFFLINE, "User " + toUserId + " is offline");
+        logger.info(
+            "[{}] handleSendMessage() - target user userName={} is offline",
+            serverReplicaId,
+            cosmosDBHandler.getUserName(toUserId));
       }
 
       private void handleHeartbeatPing(HeartbeatPing heartbeat) {
-        logger.debug("[{}] handleHeartbeatPing() - received heartbeat Ping from session: {}", serverReplicaId, session.getSessionId());
-        connectionRegistry.updateHeartbeat(userId);
+        logger.debug(
+            "[{}] handleHeartbeatPing() - received heartbeat Ping from session: {}",
+            serverReplicaId,
+            session.getSessionId());
+
+        if (isAuthenticated && effectiveUserId != null && !effectiveUserId.isBlank()) {
+          connectionRegistry.updateHeartbeat(effectiveUserId);
+        }
 
         HeartbeatPong pong = HeartbeatPong.newBuilder().setTs(Instant.now().toEpochMilli()).build();
         session.send(ServerEvent.newBuilder().setHeartbeatPong(pong).build());
@@ -199,19 +280,15 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
       }
 
       private void cleanup() {
-        if (isRegistered) {
-          connectionRegistry.handleUserOffline(userId, responseObserver);
-          logger.info("[{}] unregistered userId={}", serverReplicaId, userId);
+        if (isAuthenticated && effectiveUserId != null) {
+          connectionRegistry.handleUserOffline(effectiveUserId, responseObserver);
+          logger.info("[{}] user offline userId={}, email={}", serverReplicaId, effectiveUserId, effectiveEmail);
         }
       }
-    };
-  }
 
-  private void logConnectionState(String userId, boolean userExists) {
-    if (userExists) {
-      logger.info("[{}] connected user: {}, userId={}", serverReplicaId, cosmosDBHandler.getUserName(userId), userId);
-    } else {
-      logger.info("[{}] new connection from un-registered userId={}", serverReplicaId, userId);
-    }
+      private String normalizeEmail(String email) {
+        return email == null ? "" : email.trim().toLowerCase();
+      }
+    };
   }
 }

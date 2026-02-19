@@ -127,19 +127,21 @@ public class ConnectionRegistry {
    * Delivers a message received from Redis Stream to the local user session.
    * Called by RedisHandler consumer loop.
    */
-  public void deliverRemoteMessage(String toUserId, String targetSessionId, Map<Object, Object> messageData) {
+  public void deliverRemoteMessage(String toUserId, String targetSessionId, Map<Object, Object> streamMessageRecord) {
       UserSession session = connectionsMap.get(toUserId);
       if (session != null && session.getSessionId().equals(targetSessionId)) {
           try {
-              String fromUserId = (String) messageData.get("fromUserId");
-              String chatPayload = (String) messageData.get("chatPayload"); // Assuming JSON or text
-              String messageId = (String) messageData.get("messageId");
+              String fromUserId = (String) streamMessageRecord.get("fromUserId");
+              String fromEmail = (String) streamMessageRecord.get("fromEmail");
+              String chatPayload = (String) streamMessageRecord.get("chatPayload"); // Assuming JSON or text
+              String messageId = (String) streamMessageRecord.get("messageId");
 
               // Reconstruct ChatMessage. 
               // Note: In a real app, you might serialize/deserialize the full protobuf or JSON object.
               // Here we assume simple text payload for the POC.
               ChatMessage chatMessage = ChatMessage.newBuilder()
                   .setFromUserId(fromUserId)
+                  .setFromEmail(fromEmail)
                   .setText(chatPayload) // Assuming payload is the text
                   .setServerMsgId(messageId)
                   .setTs(System.currentTimeMillis()) // Or parse from message if available
@@ -167,14 +169,15 @@ public class ConnectionRegistry {
    * Forwards a message to a target instance via Redis Stream.
    */
   public void ReplayMessageToNode(String targetInstanceId, String toUserId, String targetSessionId, ChatMessage message) {
-      Map<String, String> fields = new java.util.HashMap<>();
-      fields.put("toUserId", toUserId);
-      fields.put("fromUserId", message.getFromUserId());
-      fields.put("messageId", message.getServerMsgId());
-      fields.put("chatPayload", message.getText());
-      fields.put("targetSessionId", targetSessionId);
+      Map<String, String> streamMessageRecord = new java.util.HashMap<>();
+      streamMessageRecord.put("toUserId", toUserId);
+      streamMessageRecord.put("fromUserId", message.getFromUserId());
+      streamMessageRecord.put("fromEmail", message.getFromEmail());
+      streamMessageRecord.put("messageId", message.getServerMsgId());
+      streamMessageRecord.put("chatPayload", message.getText());
+      streamMessageRecord.put("targetSessionId", targetSessionId);
       
-      redisHandler.publishRelayMessage(targetInstanceId, fields);
+      redisHandler.publishRelayMessage(targetInstanceId, streamMessageRecord);
   }
 
   @PreDestroy
