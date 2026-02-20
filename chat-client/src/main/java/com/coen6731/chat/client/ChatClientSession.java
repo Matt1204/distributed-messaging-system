@@ -41,6 +41,7 @@ public class ChatClientSession {
   private final AtomicReference<CountDownLatch> authLatchRef = new AtomicReference<>();
   private volatile boolean lastAuthAttemptSuccess = false;
   private volatile String lastAuthError = null;
+  private volatile ClientUiListener uiListener;
 
   private volatile int reconnectDelayMs = 1000;
   private static final int MAX_RECONNECT_DELAY_MS = 5000;
@@ -64,6 +65,7 @@ public class ChatClientSession {
 
     try {
       System.out.println("[client] connect(): Connecting to " + target + "...");
+      notifyInfo("[client] connect(): Connecting to " + target + "...");
 
       ManagedChannelBuilder<?> builder = ManagedChannelBuilder.forTarget(target);
       if (target.endsWith(":443")) {
@@ -88,15 +90,18 @@ public class ChatClientSession {
           this::onConnectionHealthy,
           this::onAuthSuccess,
           this::onAuthFailed,
-          () -> this.currentUserId
+          () -> this.currentUserId,
+          () -> this.uiListener
       );
 
       this.requestObserver = stub.chat(responseHandler);
 
       heartbeatManager.start();
       System.out.println("[client] Connection initiated... waiting for server response.");
+      notifyInfo("[client] Connection initiated... waiting for server response.");
     } catch (Exception e) {
       System.out.println("[client] Connection setup failed: " + e.getMessage());
+      notifyInfo("[client] Connection setup failed: " + e.getMessage());
       triggerReconnect();
     }
   }
@@ -104,6 +109,7 @@ public class ChatClientSession {
   private void onConnectionHealthy() {
     if (!isConnected.get()) {
       isConnected.set(true);
+      notifyConnectionState(true);
     }
     heartbeatManager.resetMissedPongs();
     reconnectDelayMs = 1000;
@@ -124,6 +130,8 @@ public class ChatClientSession {
     }
 
     System.out.println("[client] Authentication successful. Logged in as " + currentEmail + " (" + currentUserId + ")");
+    notifyInfo("[client] Authentication successful. Logged in as " + currentEmail + " (" + currentUserId + ")");
+    notifyAuthState(true, currentEmail, null);
   }
 
   private synchronized void initializeUserDatabase(String userId, String email) {
@@ -139,10 +147,12 @@ public class ChatClientSession {
     if (!dbExists) {
       dbManager.updateUserState(userId, email, null);
       System.out.println("[client] created user database: " + perUserDbPath);
+      notifyInfo("[client] created user database: " + perUserDbPath);
     } else {
       String currentSync = dbManager.getLastSyncSequenceId(userId);
       dbManager.updateUserState(userId, email, currentSync);
       System.out.println("[client] connected to user database: " + perUserDbPath);
+      notifyInfo("[client] connected to user database: " + perUserDbPath);
     }
   }
 
@@ -156,6 +166,7 @@ public class ChatClientSession {
     if (code != null && (code.startsWith("AUTH_") || code.equals("BAD_REQUEST") || code.equals("INTERNAL"))) {
       this.lastAuthAttemptSuccess = false;
       this.lastAuthError = "code=" + code + " reason=" + reason;
+      notifyAuthState(false, currentEmail, lastAuthError);
       CountDownLatch latch = authLatchRef.getAndSet(null);
       if (latch != null) {
         latch.countDown();
@@ -177,6 +188,8 @@ public class ChatClientSession {
     int delay = reconnectDelayMs + jitter;
 
     System.out.println("[client] Reconnecting in " + delay + "ms...");
+    notifyInfo("[client] Reconnecting in " + delay + "ms...");
+    notifyConnectionState(false);
 
     try {
       scheduler.schedule(() -> {
@@ -222,10 +235,12 @@ public class ChatClientSession {
   public void sendMessage(String toEmail, String text) {
     if (!isAuthenticated.get()) {
       System.out.println("[client] Not authenticated. Please login/register first.");
+      notifyInfo("[client] Not authenticated. Please login/register first.");
       return;
     }
     if (requestObserver == null) {
       System.out.println("[client] Not connected. Queuing not implemented.");
+      notifyInfo("[client] Not connected. Queuing not implemented.");
       return;
     }
     SendMessage sendMessage = SendMessage.newBuilder()
@@ -237,6 +252,7 @@ public class ChatClientSession {
       requestObserver.onNext(ClientEvent.newBuilder().setSendMessage(sendMessage).build());
     } catch (Exception e) {
       System.out.println("[client] Failed to send message: " + e.getMessage());
+      notifyInfo("[client] Failed to send message: " + e.getMessage());
       triggerReconnect();
     }
   }
@@ -254,10 +270,12 @@ public class ChatClientSession {
   private boolean sendAuthRequest(ClientEvent event) {
     if (requestObserver == null) {
       System.out.println("[client] Not connected. Cannot authenticate now.");
+      notifyInfo("[client] Not connected. Cannot authenticate now.");
       return false;
     }
     if (isAuthenticated.get()) {
       System.out.println("[client] Already authenticated as " + currentEmail);
+      notifyInfo("[client] Already authenticated as " + currentEmail);
       return true;
     }
 
@@ -271,6 +289,7 @@ public class ChatClientSession {
     } catch (Exception e) {
       authLatchRef.set(null);
       lastAuthError = "Failed to send auth request: " + e.getMessage();
+      notifyAuthState(false, currentEmail, lastAuthError);
       triggerReconnect();
       return false;
     }
@@ -280,6 +299,7 @@ public class ChatClientSession {
       if (!completed) {
         authLatchRef.compareAndSet(latch, null);
         lastAuthError = "Authentication timed out";
+        notifyAuthState(false, currentEmail, lastAuthError);
         return false;
       }
       return lastAuthAttemptSuccess;
@@ -287,6 +307,7 @@ public class ChatClientSession {
       Thread.currentThread().interrupt();
       authLatchRef.compareAndSet(latch, null);
       lastAuthError = "Authentication interrupted";
+      notifyAuthState(false, currentEmail, lastAuthError);
       return false;
     }
   }
@@ -299,10 +320,36 @@ public class ChatClientSession {
     return lastAuthError;
   }
 
+  public void setUiListener(ClientUiListener listener) {
+    this.uiListener = listener;
+  }
+
   public void close() {
     System.out.println("[client] Closing session...");
+    notifyInfo("[client] Closing session...");
     isClosing.set(true);
     teardown();
     scheduler.shutdownNow();
+  }
+
+  private void notifyInfo(String text) {
+    ClientUiListener listener = uiListener;
+    if (listener != null) {
+      listener.onInfo(text);
+    }
+  }
+
+  private void notifyConnectionState(boolean connected) {
+    ClientUiListener listener = uiListener;
+    if (listener != null) {
+      listener.onConnectionState(connected);
+    }
+  }
+
+  private void notifyAuthState(boolean authenticated, String email, String error) {
+    ClientUiListener listener = uiListener;
+    if (listener != null) {
+      listener.onAuthState(authenticated, email, error);
+    }
   }
 }

@@ -18,6 +18,7 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
     private final Consumer<AuthSuccess> onAuthSuccess;
     private final BiConsumerString onAuthFailed;
     private final Supplier<String> currentUserIdSupplier;
+    private final Supplier<ClientUiListener> uiListenerSupplier;
 
     @FunctionalInterface
     public interface BiConsumerString {
@@ -31,7 +32,8 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
             Runnable onConnectionHealthy,
             Consumer<AuthSuccess> onAuthSuccess,
             BiConsumerString onAuthFailed,
-            Supplier<String> currentUserIdSupplier) {
+            Supplier<String> currentUserIdSupplier,
+            Supplier<ClientUiListener> uiListenerSupplier) {
         this.dbManagerSupplier = dbManagerSupplier;
         this.heartbeatManager = heartbeatManager;
         this.reconnectCallback = reconnectCallback;
@@ -39,6 +41,7 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
         this.onAuthSuccess = onAuthSuccess;
         this.onAuthFailed = onAuthFailed;
         this.currentUserIdSupplier = currentUserIdSupplier;
+        this.uiListenerSupplier = uiListenerSupplier;
     }
 
     @Override
@@ -71,24 +74,30 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
             Status status = sre.getStatus();
             if (status.getCode() == Status.Code.UNAVAILABLE || status.getCode() == Status.Code.CANCELLED) {
                 System.out.println("[client] OnError(), Server code: " + status.getCode());
+                notifyInfo("[client] OnError(), Server code: " + status.getCode());
             } else {
                 System.out.println("[client] OnError(), Stream error: " + status);
+                notifyInfo("[client] OnError(), Stream error: " + status);
             }
         } else {
             System.out.println("[client] OnError " + t.getMessage());
+            notifyInfo("[client] OnError " + t.getMessage());
         }
 
         if (heartbeatManager.isThreeStrikes()) {
             System.out.println("[client] OnError(), already 3 strikes, calling reconnect immediately");
+            notifyInfo("[client] OnError(), already 3 strikes, calling reconnect immediately");
             reconnectCallback.run();
         } else {
             System.out.println("[client] OnError(), not 3 strikes, wait next ping...");
+            notifyInfo("[client] OnError(), not 3 strikes, wait next ping...");
         }
     }
 
     @Override
     public void onCompleted() {
         System.out.println("[client] stream closed by server");
+        notifyInfo("[client] stream closed by server");
         reconnectCallback.run();
     }
 
@@ -100,6 +109,7 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
         DatabaseManager dbManager = dbManagerSupplier.get();
         if (dbManager == null) {
             System.out.println("[client] received message before local user database is ready");
+            notifyInfo("[client] received message before local user database is ready");
             return;
         }
         dbManager.insertMessage(msg.getServerMsgId(), msg.getFromUserId(), msg.getText(), msg.getTs());
@@ -116,6 +126,10 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
                         + ", "
                         + msg.getTs()
                         + ")");
+        ClientUiListener listener = uiListenerSupplier.get();
+        if (listener != null) {
+            listener.onChatMessage(msg.getFromEmail(), msg.getText(), msg.getServerMsgId(), msg.getTs());
+        }
     }
 
     private void handleServerError(ServerError err) {
@@ -123,5 +137,16 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
             onAuthFailed.accept(err.getCode(), err.getReason());
         }
         System.out.println("ERROR code=" + err.getCode() + " reason=" + err.getReason());
+        ClientUiListener listener = uiListenerSupplier.get();
+        if (listener != null) {
+            listener.onError(err.getCode(), err.getReason());
+        }
+    }
+
+    private void notifyInfo(String text) {
+        ClientUiListener listener = uiListenerSupplier.get();
+        if (listener != null) {
+            listener.onInfo(text);
+        }
     }
 }
