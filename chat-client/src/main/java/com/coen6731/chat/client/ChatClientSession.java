@@ -4,14 +4,17 @@ import com.coen6731.chat.AuthSuccess;
 import com.coen6731.chat.ClientEvent;
 import com.coen6731.chat.LoginUser;
 import com.coen6731.chat.MessagingServiceGrpc;
+import com.coen6731.chat.OutboundMessage;
 import com.coen6731.chat.RegisterUser;
-import com.coen6731.chat.SendMessage;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.Metadata;
 import io.grpc.stub.MetadataUtils;
 import io.grpc.stub.StreamObserver;
 import java.nio.file.Path;
+import java.time.Instant;
+import java.util.Collections;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -21,6 +24,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
+/**
+ * Responsibility: manage client grpc stream lifecycle, auth flow, and outbound sends.
+ * Input: UI auth/send actions and server stream callbacks.
+ * Output: grpc requests, DB updates, and UI listener notifications.
+ */
 public class ChatClientSession {
   private final String target;
   private volatile DatabaseManager dbManager;
@@ -46,6 +54,11 @@ public class ChatClientSession {
   private volatile int reconnectDelayMs = 1000;
   private static final int MAX_RECONNECT_DELAY_MS = 5000;
 
+  /**
+   * Responsibility: create session object and start initial connect attempt.
+   * Input: grpc target endpoint.
+   * Output: live connection startup.
+   */
   public ChatClientSession(String target) {
     this.target = target;
     this.scheduler = Executors.newScheduledThreadPool(2);
@@ -59,12 +72,17 @@ public class ChatClientSession {
     connect();
   }
 
+  /**
+   * Responsibility: open grpc stream and attach stream handlers.
+   * Input: current auth state for optional header attachment.
+   * Output: active request observer and heartbeat scheduler.
+   */
   private synchronized void connect() {
-    if (isClosing.get()) return;
-    if (isConnected.get()) return;
+    if (isClosing.get() || isConnected.get()) {
+      return;
+    }
 
     try {
-      System.out.println("[client] connect(): Connecting to " + target + "...");
       notifyInfo("[client] connect(): Connecting to " + target + "...");
 
       ManagedChannelBuilder<?> builder = ManagedChannelBuilder.forTarget(target);
@@ -76,36 +94,38 @@ public class ChatClientSession {
       this.channel = builder.build();
 
       MessagingServiceGrpc.MessagingServiceStub stub = MessagingServiceGrpc.newStub(channel);
-
       if (isAuthenticated.get() && currentUserId != null && !currentUserId.isBlank()) {
         Metadata metadata = new Metadata();
         metadata.put(Metadata.Key.of("x-user-id", Metadata.ASCII_STRING_MARSHALLER), currentUserId);
         stub = stub.withInterceptors(MetadataUtils.newAttachHeadersInterceptor(metadata));
       }
 
-      ServerResponseHandler responseHandler = new ServerResponseHandler(
-          () -> this.dbManager,
-          heartbeatManager,
-          this::triggerReconnect,
-          this::onConnectionHealthy,
-          this::onAuthSuccess,
-          this::onAuthFailed,
-          () -> this.currentUserId,
-          () -> this.uiListener
-      );
+      ServerResponseHandler responseHandler =
+          new ServerResponseHandler(
+              () -> this.dbManager,
+              heartbeatManager,
+              this::triggerReconnect,
+              this::onConnectionHealthy,
+              this::onAuthSuccess,
+              this::onAuthFailed,
+              () -> this.currentUserId,
+              () -> this.currentEmail,
+              () -> this.uiListener);
 
       this.requestObserver = stub.chat(responseHandler);
-
       heartbeatManager.start();
-      System.out.println("[client] Connection initiated... waiting for server response.");
       notifyInfo("[client] Connection initiated... waiting for server response.");
     } catch (Exception e) {
-      System.out.println("[client] Connection setup failed: " + e.getMessage());
       notifyInfo("[client] Connection setup failed: " + e.getMessage());
       triggerReconnect();
     }
   }
 
+  /**
+   * Responsibility: mark link healthy and reset reconnect backoff.
+   * Input: any successful inbound server event.
+   * Output: connection-state callback and heartbeat reset.
+   */
   private void onConnectionHealthy() {
     if (!isConnected.get()) {
       isConnected.set(true);
@@ -115,6 +135,11 @@ public class ChatClientSession {
     reconnectDelayMs = 1000;
   }
 
+  /**
+   * Responsibility: process auth success and initialize per-user local DB.
+   * Input: auth success payload.
+   * Output: authenticated state and local persistence ready.
+   */
   private void onAuthSuccess(AuthSuccess authSuccess) {
     this.currentUserId = authSuccess.getUserId();
     this.currentEmail = authSuccess.getEmail();
@@ -129,11 +154,21 @@ public class ChatClientSession {
       latch.countDown();
     }
 
-    System.out.println("[client] Authentication successful. Logged in as " + currentEmail + " (" + currentUserId + ")");
-    notifyInfo("[client] Authentication successful. Logged in as " + currentEmail + " (" + currentUserId + ")");
+    notifyInfo(
+        "[client] Authentication successful. Logged in as "
+            + currentEmail
+            + " ("
+            + currentUserId
+            + ")");
     notifyAuthState(true, currentEmail, null);
+    notifyConversationDataChanged();
   }
 
+  /**
+   * Responsibility: open/create sqlite db bound to authenticated user email.
+   * Input: user id and email from auth success.
+   * Output: ready DatabaseManager and updated user_state row.
+   */
   private synchronized void initializeUserDatabase(String userId, String email) {
     if (email == null || email.isBlank()) {
       throw new IllegalStateException("Cannot initialize user database: email is empty.");
@@ -146,22 +181,30 @@ public class ChatClientSession {
 
     if (!dbExists) {
       dbManager.updateUserState(userId, email, null);
-      System.out.println("[client] created user database: " + perUserDbPath);
       notifyInfo("[client] created user database: " + perUserDbPath);
     } else {
       String currentSync = dbManager.getLastSyncSequenceId(userId);
       dbManager.updateUserState(userId, email, currentSync);
-      System.out.println("[client] connected to user database: " + perUserDbPath);
       notifyInfo("[client] connected to user database: " + perUserDbPath);
     }
   }
 
+  /**
+   * Responsibility: generate safe db path for per-user local storage.
+   * Input: user email.
+   * Output: sqlite file path.
+   */
   private String resolveUserDbPath(String email) {
     String normalizedEmail = email.trim().toLowerCase();
     String safeName = normalizedEmail.replaceAll("[^a-z0-9@._-]", "_");
     return Path.of("chat-client", "db", safeName + ".db").toString();
   }
 
+  /**
+   * Responsibility: capture auth failure and release waiting caller.
+   * Input: error code and reason.
+   * Output: auth state notification and latch countdown.
+   */
   private void onAuthFailed(String code, String reason) {
     if (code != null && (code.startsWith("AUTH_") || code.equals("BAD_REQUEST") || code.equals("INTERNAL"))) {
       this.lastAuthAttemptSuccess = false;
@@ -174,6 +217,11 @@ public class ChatClientSession {
     }
   }
 
+  /**
+   * Responsibility: teardown stream and schedule reconnect with backoff+jitter.
+   * Input: reconnect trigger event.
+   * Output: delayed connect retry.
+   */
   private synchronized void triggerReconnect() {
     if (isClosing.get()) {
       return;
@@ -187,25 +235,32 @@ public class ChatClientSession {
     int jitter = (int) (Math.random() * 500);
     int delay = reconnectDelayMs + jitter;
 
-    System.out.println("[client] Reconnecting in " + delay + "ms...");
     notifyInfo("[client] Reconnecting in " + delay + "ms...");
     notifyConnectionState(false);
 
     try {
-      scheduler.schedule(() -> {
-        isReconnecting.set(false);
-        if (!isClosing.get()) {
-          connect();
-        }
-      }, delay, TimeUnit.MILLISECONDS);
+      scheduler.schedule(
+          () -> {
+            isReconnecting.set(false);
+            if (!isClosing.get()) {
+              connect();
+            }
+          },
+          delay,
+          TimeUnit.MILLISECONDS);
 
       reconnectDelayMs = Math.min(reconnectDelayMs * 2, MAX_RECONNECT_DELAY_MS);
     } catch (RejectedExecutionException e) {
       isReconnecting.set(false);
-      System.out.println("[client] Reconnect scheduling rejected: " + e.getMessage());
+      notifyInfo("[client] Reconnect scheduling rejected: " + e.getMessage());
     }
   }
 
+  /**
+   * Responsibility: close current grpc resources and reset runtime flags.
+   * Input: none.
+   * Output: closed stream/channel and pending auth latch release.
+   */
   private void teardown() {
     heartbeatManager.stop();
 
@@ -232,49 +287,98 @@ public class ChatClientSession {
     }
   }
 
-  public void sendMessage(String toEmail, String text) {
+  /**
+   * Responsibility: send one outbound message and insert provisional local row before send.
+   * Input: recipient email, text, and optional existing conversation/peer user id.
+   * Output: outbound grpc event plus provisional SQLite row.
+   */
+  public void sendMessage(String toEmail, String text, String conversationId, String peerUserId) {
     if (!isAuthenticated.get()) {
-      System.out.println("[client] Not authenticated. Please login/register first.");
       notifyInfo("[client] Not authenticated. Please login/register first.");
       return;
     }
     if (requestObserver == null) {
-      System.out.println("[client] Not connected. Queuing not implemented.");
       notifyInfo("[client] Not connected. Queuing not implemented.");
       return;
     }
-    SendMessage sendMessage = SendMessage.newBuilder()
-        .setToEmail(toEmail)
-        .setText(text)
-        .setClientMsgId(UUID.randomUUID().toString())
-        .build();
+
+    String normalizedToEmail = toEmail == null ? "" : toEmail.trim().toLowerCase();
+    String trimmedText = text == null ? "" : text.trim();
+    String normalizedConversationId = conversationId == null ? "" : conversationId.trim();
+    String normalizedPeerUserId = peerUserId == null ? "" : peerUserId.trim();
+    String clientMsgId = UUID.randomUUID().toString();
+
+    if (normalizedToEmail.isBlank() || trimmedText.isBlank()) {
+      notifyInfo("[client] sendMessage requires toEmail and non-empty text.");
+      return;
+    }
+
+    DatabaseManager localDb = this.dbManager;
+    if (localDb != null) {
+      // Core logic: keep provisional row so UI can render outbound intent before ack arrives.
+      localDb.upsertOutboundProvisional(
+          clientMsgId,
+          normalizedConversationId,
+          safe(currentUserId),
+          safe(currentEmail),
+          normalizedPeerUserId,
+          normalizedToEmail,
+          trimmedText,
+          Instant.now().toEpochMilli());
+      notifyConversationDataChanged();
+    }
+
+    OutboundMessage outboundMessage =
+        OutboundMessage.newBuilder()
+            .setToEmail(normalizedToEmail)
+            .setText(trimmedText)
+            .setClientMsgId(clientMsgId)
+            .setConversationId(normalizedConversationId)
+            .build();
+
     try {
-      requestObserver.onNext(ClientEvent.newBuilder().setSendMessage(sendMessage).build());
+      requestObserver.onNext(ClientEvent.newBuilder().setOutboundMessage(outboundMessage).build());
     } catch (Exception e) {
-      System.out.println("[client] Failed to send message: " + e.getMessage());
       notifyInfo("[client] Failed to send message: " + e.getMessage());
+      if (localDb != null) {
+        localDb.deleteOutboundByClientMsgId(clientMsgId);
+        notifyConversationDataChanged();
+      }
       triggerReconnect();
     }
   }
 
+  /**
+   * Responsibility: send login request and wait for auth result.
+   * Input: email and password.
+   * Output: true when login succeeds.
+   */
   public boolean login(String email, String password) {
     LoginUser loginUser = LoginUser.newBuilder().setEmail(email).setPassword(password).build();
     return sendAuthRequest(ClientEvent.newBuilder().setLoginUser(loginUser).build());
   }
 
+  /**
+   * Responsibility: send register request and wait for auth result.
+   * Input: email and password.
+   * Output: true when registration succeeds.
+   */
   public boolean register(String email, String password) {
     RegisterUser registerUser = RegisterUser.newBuilder().setEmail(email).setPassword(password).build();
     return sendAuthRequest(ClientEvent.newBuilder().setRegisterUser(registerUser).build());
   }
 
+  /**
+   * Responsibility: send auth event and block caller until success/failure/timeout.
+   * Input: login/register client event.
+   * Output: auth outcome boolean.
+   */
   private boolean sendAuthRequest(ClientEvent event) {
     if (requestObserver == null) {
-      System.out.println("[client] Not connected. Cannot authenticate now.");
       notifyInfo("[client] Not connected. Cannot authenticate now.");
       return false;
     }
     if (isAuthenticated.get()) {
-      System.out.println("[client] Already authenticated as " + currentEmail);
       notifyInfo("[client] Already authenticated as " + currentEmail);
       return true;
     }
@@ -312,26 +416,76 @@ public class ChatClientSession {
     }
   }
 
+  /**
+   * Responsibility: expose latest local conversation list for UI.
+   * Input: none.
+   * Output: sorted conversation summaries.
+   */
+  public List<DatabaseManager.ConversationSummary> listConversations() {
+    DatabaseManager localDb = dbManager;
+    if (localDb == null) {
+      return Collections.emptyList();
+    }
+    return localDb.listConversations();
+  }
+
+  /**
+   * Responsibility: expose latest local messages for selected conversation.
+   * Input: conversation id and max items.
+   * Output: chronological conversation messages.
+   */
+  public List<DatabaseManager.MessageRow> listLatestMessages(String conversationId, int limit) {
+    DatabaseManager localDb = dbManager;
+    if (localDb == null || conversationId == null || conversationId.isBlank()) {
+      return Collections.emptyList();
+    }
+    return localDb.listLatestMessages(conversationId, limit);
+  }
+
+  /**
+   * Responsibility: return current auth state.
+   * Input: none.
+   * Output: true when authenticated.
+   */
   public boolean isAuthenticated() {
     return isAuthenticated.get();
   }
 
+  /**
+   * Responsibility: return last auth failure message for UI.
+   * Input: none.
+   * Output: error text or null.
+   */
   public String getLastAuthError() {
     return lastAuthError;
   }
 
+  /**
+   * Responsibility: register UI listener for callbacks.
+   * Input: listener implementation.
+   * Output: stored callback reference.
+   */
   public void setUiListener(ClientUiListener listener) {
     this.uiListener = listener;
   }
 
+  /**
+   * Responsibility: close session resources and stop schedulers.
+   * Input: none.
+   * Output: closed client session.
+   */
   public void close() {
-    System.out.println("[client] Closing session...");
     notifyInfo("[client] Closing session...");
     isClosing.set(true);
     teardown();
     scheduler.shutdownNow();
   }
 
+  /**
+   * Responsibility: forward informational text to UI listener.
+   * Input: info text message.
+   * Output: listener callback side-effect.
+   */
   private void notifyInfo(String text) {
     ClientUiListener listener = uiListener;
     if (listener != null) {
@@ -339,6 +493,11 @@ public class ChatClientSession {
     }
   }
 
+  /**
+   * Responsibility: notify UI about connection state transitions.
+   * Input: connected flag.
+   * Output: listener callback side-effect.
+   */
   private void notifyConnectionState(boolean connected) {
     ClientUiListener listener = uiListener;
     if (listener != null) {
@@ -346,10 +505,36 @@ public class ChatClientSession {
     }
   }
 
+  /**
+   * Responsibility: notify UI about auth state changes.
+   * Input: auth flag, email, and optional error.
+   * Output: listener callback side-effect.
+   */
   private void notifyAuthState(boolean authenticated, String email, String error) {
     ClientUiListener listener = uiListener;
     if (listener != null) {
       listener.onAuthState(authenticated, email, error);
     }
+  }
+
+  /**
+   * Responsibility: notify UI that conversation/message data changed in local DB.
+   * Input: none.
+   * Output: listener callback side-effect.
+   */
+  private void notifyConversationDataChanged() {
+    ClientUiListener listener = uiListener;
+    if (listener != null) {
+      listener.onConversationDataChanged();
+    }
+  }
+
+  /**
+   * Responsibility: normalize nullable strings before DB/proto writes.
+   * Input: nullable value.
+   * Output: non-null string.
+   */
+  private String safe(String value) {
+    return value == null ? "" : value;
   }
 }
