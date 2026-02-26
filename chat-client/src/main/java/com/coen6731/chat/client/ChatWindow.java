@@ -39,8 +39,6 @@ public class ChatWindow extends JFrame implements ClientUiListener {
 
   private final ChatClientSession session;
   private final boolean debugSidebarEnabled;
-  // TEST ONLY - TO BE REMOVED
-  private final ChatClient.TestConfig testConfig;
   private final CardLayout cardLayout = new CardLayout();
   private final JPanel cardPanel = new JPanel(cardLayout);
 
@@ -68,40 +66,13 @@ public class ChatWindow extends JFrame implements ClientUiListener {
    * Input: session transport and debug sidebar toggle.
    * Output: visible ready-to-use window instance.
    */
-  public ChatWindow(ChatClientSession session, boolean debugSidebarEnabled, ChatClient.TestConfig testConfig) {
+  public ChatWindow(ChatClientSession session, boolean debugSidebarEnabled) {
     super("Chat Client");
     this.session = session;
     this.debugSidebarEnabled = debugSidebarEnabled;
-    this.testConfig = testConfig;
     this.session.setUiListener(this);
     buildUi();
     wireActions();
-    handleAutoLogin();
-  }
-
-  /**
-   * TEST ONLY - TO BE REMOVED
-   * Responsibility: handle auto-login if configured.
-   */
-  private void handleAutoLogin() {
-    if (testConfig != null && testConfig.skipLogin) {
-      String email = null;
-      String password = null;
-      if (testConfig.selectUserA) {
-        email = testConfig.userAEmail;
-        password = testConfig.userAPassword;
-      } else if (testConfig.selectUserB) {
-        email = testConfig.userBEmail;
-        password = testConfig.userBPassword;
-      }
-
-      if (email != null && password != null) {
-        emailField.setText(email);
-        passwordField.setText(password);
-        System.out.println("[test] auto-login triggered for: " + email);
-        runAuth(true);
-      }
-    }
   }
 
   /**
