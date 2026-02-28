@@ -7,88 +7,150 @@ option java_package = "com.coen6731.chat";
 option java_outer_classname = "ChatProto";
 
 service MessagingService {
-  // A bidirectional streaming RPC.
-  // Both the client and server can send a stream of messages to each other.
-  // 'stream ClientEvent' means the client sends a stream of ClientEvent messages.
-  // 'returns (stream ServerEvent)' means the server responds with a stream of ServerEvent messages.
+  // Bidirectional streaming chat RPC. Input is client events and output is server events.
   rpc Chat(stream ClientEvent) returns (stream ServerEvent);
 }
 
 // client -> server
 message ClientEvent {
   oneof payload {
-    LoginUser loginUser = 1; 
-    RegisterUser registerUser = 2; 
-    SendMessage sendMessage = 3;
+    LoginUser loginUser = 1;
+    RegisterUser registerUser = 2;
+    OutboundMessage outboundMessage = 3;
     HeartbeatPing heartbeatPing = 4;
-    Catchup catchup = 5;
+    CatchupRequest catchupRequest = 5;
+    GetMsgHistoryRequest getMsgHistoryRequest = 6;
   }
 }
 
 // server -> client
 message ServerEvent {
   oneof payload {
-    ChatMessage chatMessage = 1; // message from server to client.
+    InboundMessage inboundMessage = 1;
     ServerError serverError = 2;
-    CatchupComplete catchupComplete = 3;
+    CatchupResult catchupResult = 3;
     HeartbeatPong heartbeatPong = 4;
     AuthSuccess authSuccess = 5;
+    SendMessageAck sendMessageAck = 6;
+    MsgHistoryResult msgHistoryResult = 7;
   }
 }
 
 // ------------------------------------------------------------------------------------------------
 // client messages
 
-// notify server this user is available, add to connection registry.
+// Login request.
 message LoginUser {
   string email = 1;
   string password = 2;
 }
 
-// sned new user information to server, add to database.
+// Register request.
 message RegisterUser {
   string email = 1;
   string password = 2;
 }
 
-message SendMessage {
-  string toEmail = 1; // The recipient's email.
-  string text = 2;     // The content of the message.
-  string clientMsgId = 3; // A client-generated ID for tracking/deduplication.
+// Outbound chat message from sender to recipient.
+message OutboundMessage {
+  string toEmail = 1;
+  string text = 2;
+  string clientMsgId = 3;
+  string conversationId = 4;
 }
 
-// Heartbeat message to keep the connection alive.
+// Heartbeat request used to keep stream healthy.
 message HeartbeatPing {
-  int64 ts = 1; // Timestamp of the heartbeat.
+  int64 ts = 1;
 }
 
-message Catchup {
-  string userId = 1; // my user id
-  int64 lastSyncSequenceId = 2; // the last sequence id i have received
+message CatchupRequest {
+  repeated ConversationCursor cursorHints = 1;
+  int32 perConversationLimit = 2;
 }
-  
+
+message ConversationCursor {
+  string conversationId = 1;
+  int64 clientLastReceivedSequenceId = 2;
+}
+
+message GetMsgHistoryRequest {
+  string conversationId = 1;
+  int64 beforeSequenceId = 2;
+  int32 retriveMsgQuantity = 3;
+}
+
 // ------------------------------------------------------------------------------------------------
 // server messages
-message ChatMessage {
-  string fromUserId = 1; // The sender's user ID.
-  string fromEmail = 2; // The sender's email.
-  string text = 3;       // The message content.
-  string serverMsgId = 4; // Unique ID assigned by the server.
-  int64 ts = 5;          // Timestamp when the message was processed by the server.
+
+message CanonicalMessage {
+  string serverMsgId = 1;
+  string clientMsgId = 2;
+  string conversationId = 3;
+  int64 sequenceId = 4;
+  string fromUserId = 5;
+  string fromEmail = 6;
+  string toUserId = 7;
+  string text = 8;
+  int64 sentAtMs = 9;
+}
+
+// Canonical message payload delivered to recipients.
+message InboundMessage {
+  string serverMsgId = 1;
+  string clientMsgId = 2;
+  string conversationId = 3;
+  string fromUserId = 4;
+  string fromEmail = 5;
+  string toUserId = 6;
+  string text = 7;
+  int64 sentAtMs = 8;
+  int64 sequenceId = 9;
+}
+
+// Outbound send status reported back to sender.
+message SendMessageAck {
+  string clientMsgId = 1;
+  string serverMsgId = 2;
+  string conversationId = 3;
+  SendStatus status = 4;
+  string errorCode = 5;
+  string errorReason = 6;
+  int64 ackTs = 7;
+  int64 sequenceId = 8;
+}
+
+message CatchupConversationResult {
+  string conversationId = 1;
+  int64 conversationLatestSequenceId = 2;
+  repeated CanonicalMessage messages = 3;
+}
+
+message CatchupResult {
+  repeated CatchupConversationResult conversationResults = 1;
+  int64 generatedAtMs = 2;
+}
+
+message MsgHistoryResult {
+  string conversationId = 1;
+  repeated CanonicalMessage messages = 2;
+}
+
+// Message persistence/delivery state for sender reconciliation.
+enum SendStatus {
+  SEND_STATUS_UNSPECIFIED = 0;
+  PERSISTED_PENDING_DELIVERY = 1;
+  FAILED = 2;
+  DELIVERED_LIVE = 3;
 }
 
 message ServerError {
-  string code = 1;   // Error code (e.g., "USER_OFFLINE").
-  string reason = 2; // Human-readable error message.
-}
-
-message CatchupComplete {
-  string userId = 1;
-  int64 truthSequenceId = 2; 
+  string code = 1;
+  string reason = 2;
 }
 
 message HeartbeatPong {
-  int64 ts = 1; // Timestamp of the heartbeat.
+  int64 ts = 1;
 }
 
 message AuthSuccess {
