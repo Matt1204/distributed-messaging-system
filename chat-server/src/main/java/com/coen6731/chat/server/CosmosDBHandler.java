@@ -13,6 +13,7 @@ import com.azure.cosmos.models.SqlQuerySpec;
 import com.azure.cosmos.util.CosmosPagedIterable;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -46,7 +47,8 @@ public class CosmosDBHandler {
   private CosmosContainer conversationsContainer;
 
   /**
-   * Responsibility: initialize Cosmos client and container handles used by the service.
+   * Responsibility: initialize Cosmos client and container handles used by the
+   * service.
    * Input: values injected from Spring configuration.
    * Output: initialized container references for users/messages/conversations.
    */
@@ -121,12 +123,12 @@ public class CosmosDBHandler {
 
     String normalizedEmail = normalizeEmail(email);
     String sqlText = "SELECT TOP 1 c.userId, c.email, c.passwordHash FROM c WHERE c.email = @email";
-    SqlQuerySpec querySpec =
-        new SqlQuerySpec(sqlText).setParameters(List.of(new SqlParameter("@email", normalizedEmail)));
+    SqlQuerySpec querySpec = new SqlQuerySpec(sqlText)
+        .setParameters(List.of(new SqlParameter("@email", normalizedEmail)));
 
     try {
-      CosmosPagedIterable<Map> results =
-          usersContainer.queryItems(querySpec, new CosmosQueryRequestOptions(), Map.class);
+      CosmosPagedIterable<Map> results = usersContainer.queryItems(querySpec, new CosmosQueryRequestOptions(),
+          Map.class);
       for (Map record : results) {
         Object userIdObj = record.get("userId");
         Object emailObj = record.get("email");
@@ -165,42 +167,13 @@ public class CosmosDBHandler {
         return Optional.empty();
       }
       return Optional.of(
-          new UserRecord(asString(item.get("userId")), asString(item.get("email")), asString(item.get("passwordHash"))));
+          new UserRecord(asString(item.get("userId")), asString(item.get("email")),
+              asString(item.get("passwordHash"))));
     } catch (Exception e) {
       logger.debug("User {} not found in Cosmos DB", userId);
       return Optional.empty();
     }
   }
-
-  /**
-   * Responsibility: resolve conversation by unordered user pair key.
-   * Input: two participant userIds.
-   * Output: conversation metadata if exists, empty when no record is found.
-   */
-  // public Optional<ConversationRecord> findConversationByPair(String userA, String userB) {
-  //   if (conversationsContainer == null) {
-  //     logger.error("Conversations container not initialized");
-  //     return Optional.empty();
-  //   }
-
-  //   String pairKey = toPairKey(userA, userB);
-  //   String sql =
-  //       "SELECT TOP 1 c.id, c.pairKey, c.userA, c.userB, c.createdAtMs, c.updatedAtMs, c.lastMessageAtMs "
-  //           + "FROM c WHERE c.pairKey = @pairKey";
-  //   SqlQuerySpec query = new SqlQuerySpec(sql).setParameters(List.of(new SqlParameter("@pairKey", pairKey)));
-
-  //   try {
-  //     CosmosPagedIterable<Map> results =
-  //         conversationsContainer.queryItems(query, new CosmosQueryRequestOptions(), Map.class);
-  //     for (Map row : results) {
-  //       return Optional.of(mapConversationRecord(row));
-  //     }
-  //     return Optional.empty();
-  //   } catch (Exception e) {
-  //     logger.error("Failed to query conversation by pairKey={}", pairKey, e);
-  //     return Optional.empty();
-  //   }
-  // }
 
   /**
    * Responsibility: point-read conversation by conversationId.
@@ -213,14 +186,13 @@ public class CosmosDBHandler {
       return Optional.empty();
     }
 
-    String sql =
-        "SELECT TOP 1 c.id, c.pairKey, c.userA, c.userB, c.createdAtMs, c.updatedAtMs, c.lastMessageAtMs "
-            + "FROM c WHERE c.id = @id";
+    String sql = "SELECT TOP 1 c.id, c.memberUserIds, c.createdAtMs, c.updatedAtMs, c.lastMessageAtMs "
+        + "FROM c WHERE c.id = @id";
     SqlQuerySpec query = new SqlQuerySpec(sql).setParameters(List.of(new SqlParameter("@id", conversationId)));
 
     try {
-      CosmosPagedIterable<Map> results =
-          conversationsContainer.queryItems(query, new CosmosQueryRequestOptions(), Map.class);
+      CosmosPagedIterable<Map> results = conversationsContainer.queryItems(query, new CosmosQueryRequestOptions(),
+          Map.class);
       for (Map row : results) {
         return Optional.of(mapConversationRecord(row));
       }
@@ -232,46 +204,56 @@ public class CosmosDBHandler {
   }
 
   /**
-   * Responsibility: find or create one conversation by conversationId.
-   * Input: optional requested conversationId, participant userIds, and event timestamp.
+   * Responsibility: find or create one conversation and enforce participant
+   * membership.
+   * Input: optional conversationId, sender/recipient user ids, and current
+   * timestamp.
    * Output: existing or newly created conversation record.
    */
   public Optional<ConversationRecord> createConversationIfAbsent(
-      String requestConversationId, long nowMs) {
+      String requestConversationId,
+      String senderUserId,
+      String recipientUserId,
+      long nowMs) {
     if (conversationsContainer == null) {
       logger.error("Conversations container not initialized");
       return Optional.empty();
     }
-    String normalizedConversationId =
-        requestConversationId == null ? "" : requestConversationId.trim();
+    String normalizedConversationId = requestConversationId == null ? "" : requestConversationId.trim();
+    String conversationId = normalizedConversationId.isBlank() ? UUID.randomUUID().toString()
+        : normalizedConversationId;
 
-    String conversationId =
-        normalizedConversationId.isBlank() ? UUID.randomUUID().toString() : normalizedConversationId;
-
-    // if given conversationId is already in db, return the existing conversation.
     Optional<ConversationRecord> existingConversation = findConversationById(conversationId);
     if (existingConversation.isPresent()) {
-      return existingConversation;
+      ConversationRecord current = existingConversation.get();
+      if (current.memberUserIds().contains(senderUserId) && current.memberUserIds().contains(recipientUserId)) {
+        return existingConversation;
+      }
+      logger.warn("Conversation {} exists but does not contain both users: sender={}, recipient={}",
+          conversationId, senderUserId, recipientUserId);
+      return Optional.empty();
     }
 
-    // new conversation, create a new "conversation" record in db.
     Map<String, Object> item = new HashMap<>();
     item.put("id", conversationId);
     item.put("conversationId", conversationId);
-    // Keep pairKey as partition key, but decouple conversationId from participant pairs.
-    // item.put("pairKey", conversationId);
-    // item.put("userA", userA.compareTo(userB) <= 0 ? userA : userB);
-    // item.put("userB", userA.compareTo(userB) <= 0 ? userB : userA);
+    item.put("memberUserIds", List.of(senderUserId, recipientUserId));
     item.put("createdAtMs", nowMs);
     item.put("updatedAtMs", nowMs);
-    // item.put("lastMessageAtMs", nowMs);
+    item.put("lastMessageAtMs", nowMs);
 
     try {
       conversationsContainer.createItem(item, new PartitionKey(conversationId), null);
       return Optional.of(mapConversationRecord(item));
     } catch (CosmosException e) {
       if (e.getStatusCode() == 409) {
-        return findConversationById(conversationId);
+        Optional<ConversationRecord> conflicted = findConversationById(conversationId);
+        if (conflicted.isPresent()
+            && conflicted.get().memberUserIds().contains(senderUserId)
+            && conflicted.get().memberUserIds().contains(recipientUserId)) {
+          return conflicted;
+        }
+        return Optional.empty();
       }
       logger.error("Failed to create conversation conversationId={}", conversationId, e);
       return Optional.empty();
@@ -279,7 +261,37 @@ public class CosmosDBHandler {
   }
 
   /**
-   * Responsibility: persist one canonical message record with idempotent conflict detection.
+   * Responsibility: list all conversations where a user is a participant.
+   * Input: authenticated userId.
+   * Output: conversation records the user is authorized to access.
+   */
+  public List<ConversationRecord> findConversationsByMember(String userId) {
+    if (conversationsContainer == null) {
+      logger.error("Conversations container not initialized");
+      return List.of();
+    }
+
+    String sql = "SELECT c.id, c.memberUserIds, c.createdAtMs, c.updatedAtMs, c.lastMessageAtMs FROM c "
+        + "WHERE ARRAY_CONTAINS(c.memberUserIds, @userId)";
+    SqlQuerySpec query = new SqlQuerySpec(sql).setParameters(List.of(new SqlParameter("@userId", userId)));
+
+    List<ConversationRecord> rows = new ArrayList<>();
+    try {
+      CosmosPagedIterable<Map> results = conversationsContainer.queryItems(query, new CosmosQueryRequestOptions(),
+          Map.class);
+      for (Map row : results) {
+        rows.add(mapConversationRecord(row));
+      }
+      return rows;
+    } catch (Exception e) {
+      logger.error("Failed to query conversations for userId={}", userId, e);
+      return List.of();
+    }
+  }
+
+  /**
+   * Responsibility: persist one canonical message record with idempotent conflict
+   * detection.
    * Input: message fields already validated by service layer.
    * Output: persistence status plus the canonical stored record.
    */
@@ -294,6 +306,7 @@ public class CosmosDBHandler {
     item.put("serverMsgId", record.serverMsgId());
     item.put("clientMsgId", record.clientMsgId());
     item.put("conversationId", record.conversationId());
+    item.put("sequenceId", record.sequenceId());
     item.put("senderUserId", record.senderUserId());
     item.put("recipientUserId", record.recipientUserId());
     item.put("text", record.text());
@@ -306,7 +319,6 @@ public class CosmosDBHandler {
       messagesContainer.createItem(item, new PartitionKey(record.conversationId()), null);
       return new PersistResult(PersistStatus.CREATED, mapMessageRecord(item), null);
     } catch (CosmosException e) {
-      // Message already exists in Cosmos DB.
       if (e.getStatusCode() == 409) {
         return new PersistResult(PersistStatus.ALREADY_EXISTS, null, null);
       }
@@ -327,14 +339,13 @@ public class CosmosDBHandler {
       return Optional.empty();
     }
 
-    String sql =
-        "SELECT TOP 1 c.serverMsgId, c.clientMsgId, c.conversationId, c.senderUserId, c.recipientUserId, "
-            + "c.text, c.sentAtMs, c.status, c.createdAtMs, c.updatedAtMs FROM c WHERE c.id = @id";
+    String sql = "SELECT TOP 1 c.serverMsgId, c.clientMsgId, c.conversationId, c.sequenceId, c.senderUserId, c.recipientUserId, "
+        + "c.text, c.sentAtMs, c.status, c.createdAtMs, c.updatedAtMs FROM c WHERE c.id = @id";
     SqlQuerySpec query = new SqlQuerySpec(sql).setParameters(List.of(new SqlParameter("@id", serverMsgId)));
 
     try {
-      CosmosPagedIterable<Map> results =
-          messagesContainer.queryItems(query, new CosmosQueryRequestOptions(), Map.class);
+      CosmosPagedIterable<Map> results = messagesContainer.queryItems(query, new CosmosQueryRequestOptions(),
+          Map.class);
       for (Map row : results) {
         return Optional.of(mapMessageRecord(row));
       }
@@ -346,35 +357,226 @@ public class CosmosDBHandler {
   }
 
   /**
-   * Responsibility: update conversation activity timestamps after a message is accepted.
-   * Input: conversation id and message timestamp.
-   * Output: true when update succeeds, false otherwise.
+   * Responsibility: read latest sequence id for a conversation from durable
+   * storage.
+   * Input: conversation id.
+   * Output: max persisted sequence id, or 0 when none exists.
    */
-  // public boolean touchConversation(String conversationId, long lastMessageAtMs) {
-  //   Optional<ConversationRecord> existing = findConversationById(conversationId);
-  //   if (existing.isEmpty()) {
-  //     return false;
-  //   }
+  public long findMaxSequenceId(String conversationId) {
+    if (messagesContainer == null) {
+      logger.error("Messages container not initialized");
+      return 0L;
+    }
 
-  //   ConversationRecord current = existing.get();
-  //   Map<String, Object> item = new HashMap<>();
-  //   item.put("id", current.conversationId());
-  //   item.put("conversationId", current.conversationId());
-  //   // item.put("pairKey", current.pairKey());
-  //   // item.put("userA", current.userA());
-  //   // item.put("userB", current.userB());
-  //   item.put("createdAtMs", current.createdAtMs());
-  //   item.put("updatedAtMs", lastMessageAtMs);
-  //   // item.put("lastMessageAtMs", lastMessageAtMs);
+    String sql = "SELECT VALUE MAX(c.sequenceId) FROM c WHERE c.conversationId = @conversationId";
+    SqlQuerySpec query = new SqlQuerySpec(sql)
+        .setParameters(List.of(new SqlParameter("@conversationId", conversationId)));
 
-  //   try {
-  //     conversationsContainer.upsertItem(item, new PartitionKey(current.pairKey()), null);
-  //     return true;
-  //   } catch (Exception e) {
-  //     logger.error("Failed to update conversation timestamps conversationId={}", conversationId, e);
-  //     return false;
-  //   }
-  // }
+    try {
+      CosmosPagedIterable<Long> results = messagesContainer.queryItems(query, new CosmosQueryRequestOptions(),
+          Long.class);
+      for (Long seq : results) {
+        // return 0 if no message with given conversationId found (new conversation)
+        return seq == null ? 0L : seq;
+      }
+    } catch (Exception e) {
+      logger.error("Failed to query max sequence id for conversationId={}", conversationId, e);
+    }
+    return 0L;
+  }
+
+  /**
+   * Responsibility: fetch missing messages after a cursor in ascending sequence
+   * order.
+   * Input: conversation id, cursor (exclusive), and max rows.
+   * Output: up to limit messages sorted by sequence id asc.
+   */
+  public List<MessageRecord> listMessagesAfterSequence(String conversationId, long afterSequenceId, int limit) {
+    if (messagesContainer == null) {
+      logger.error("Messages container not initialized");
+      return List.of();
+    }
+
+    String sql = "SELECT c.serverMsgId, c.clientMsgId, c.conversationId, c.sequenceId, c.senderUserId, c.recipientUserId, "
+        + "c.text, c.sentAtMs, c.status, c.createdAtMs, c.updatedAtMs FROM c "
+        + "WHERE c.conversationId = @conversationId AND c.sequenceId > @afterSequenceId "
+        + "ORDER BY c.sequenceId ASC OFFSET 0 LIMIT @limit";
+    SqlQuerySpec query = new SqlQuerySpec(sql)
+        .setParameters(
+            List.of(
+                new SqlParameter("@conversationId", conversationId),
+                new SqlParameter("@afterSequenceId", afterSequenceId),
+                new SqlParameter("@limit", limit)));
+
+    List<MessageRecord> rows = new ArrayList<>();
+    try {
+      CosmosPagedIterable<Map> results = messagesContainer.queryItems(query, new CosmosQueryRequestOptions(),
+          Map.class);
+      for (Map row : results) {
+        rows.add(mapMessageRecord(row));
+      }
+    } catch (Exception e) {
+      logger.error("Failed to list messages after sequence conversationId={} cursor={}", conversationId,
+          afterSequenceId, e);
+    }
+    return rows;
+  }
+
+  /**
+   * Responsibility: fetch newest missing messages after a client cursor in descending sequence order.
+   * Input: conversation id, cursor (exclusive), and max rows.
+   * Output: up to limit messages sorted by sequence id desc (newest first).
+   */
+  public List<MessageRecord> listNewestMessagesAfterSequence(
+      String conversationId,
+      long afterSequenceId,
+      int limit) {
+    if (messagesContainer == null) {
+      logger.error("Messages container not initialized");
+      return List.of();
+    }
+
+    String sql =
+        "SELECT c.serverMsgId, c.clientMsgId, c.conversationId, c.sequenceId, c.senderUserId, c.recipientUserId, "
+            + "c.text, c.sentAtMs, c.status, c.createdAtMs, c.updatedAtMs FROM c "
+            + "WHERE c.conversationId = @conversationId AND c.sequenceId > @afterSequenceId "
+            + "ORDER BY c.sequenceId DESC OFFSET 0 LIMIT @limit";
+    SqlQuerySpec query =
+        new SqlQuerySpec(sql)
+            .setParameters(
+                List.of(
+                    new SqlParameter("@conversationId", conversationId),
+                    new SqlParameter("@afterSequenceId", afterSequenceId),
+                    new SqlParameter("@limit", limit)));
+
+    List<MessageRecord> rows = new ArrayList<>();
+    try {
+      CosmosPagedIterable<Map> results =
+          messagesContainer.queryItems(query, new CosmosQueryRequestOptions(), Map.class);
+      for (Map row : results) {
+        rows.add(mapMessageRecord(row));
+      }
+    } catch (Exception e) {
+      logger.error(
+          "Failed to list newest messages after sequence conversationId={} cursor={}",
+          conversationId,
+          afterSequenceId,
+          e);
+    }
+    return rows;
+  }
+
+  /**
+   * Responsibility: count how many messages exist after a given conversation cursor.
+   * Input: conversation id and cursor (exclusive).
+   * Output: number of missing messages after the cursor.
+   */
+  public long countMessagesAfterSequence(String conversationId, long afterSequenceId) {
+    if (messagesContainer == null) {
+      logger.error("Messages container not initialized");
+      return 0L;
+    }
+
+    String sql =
+        "SELECT VALUE COUNT(1) FROM c WHERE c.conversationId = @conversationId AND c.sequenceId > @afterSequenceId";
+    SqlQuerySpec query =
+        new SqlQuerySpec(sql)
+            .setParameters(
+                List.of(
+                    new SqlParameter("@conversationId", conversationId),
+                    new SqlParameter("@afterSequenceId", afterSequenceId)));
+
+    try {
+      CosmosPagedIterable<Long> results =
+          messagesContainer.queryItems(query, new CosmosQueryRequestOptions(), Long.class);
+      for (Long count : results) {
+        return count == null ? 0L : count;
+      }
+    } catch (Exception e) {
+      logger.error(
+          "Failed to count messages after sequence conversationId={} cursor={}",
+          conversationId,
+          afterSequenceId,
+          e);
+    }
+    return 0L;
+  }
+
+  /**
+   * Responsibility: fetch one descending history page starting from a given
+   * sequence id (inclusive).
+   * Input: conversation id, start sequence id (inclusive), and max rows.
+   * Output: up to quantity messages sorted by sequence id desc.
+   */
+  public List<MessageRecord> listMessagesFromSequenceDescending(
+      String conversationId,
+      long fromSequenceId,
+      int quantity) {
+    if (messagesContainer == null) {
+      logger.error("Messages container not initialized");
+      return List.of();
+    }
+
+    String sql = "SELECT c.serverMsgId, c.clientMsgId, c.conversationId, c.sequenceId, c.senderUserId, c.recipientUserId, "
+        + "c.text, c.sentAtMs, c.status, c.createdAtMs, c.updatedAtMs FROM c "
+        + "WHERE c.conversationId = @conversationId AND c.sequenceId <= @fromSequenceId "
+        + "ORDER BY c.sequenceId DESC OFFSET 0 LIMIT @quantity";
+    SqlQuerySpec query = new SqlQuerySpec(sql)
+        .setParameters(
+            List.of(
+                new SqlParameter("@conversationId", conversationId),
+                new SqlParameter("@fromSequenceId", fromSequenceId),
+                new SqlParameter("@quantity", quantity)));
+
+    List<MessageRecord> rows = new ArrayList<>();
+    try {
+      CosmosPagedIterable<Map> results = messagesContainer.queryItems(query, new CosmosQueryRequestOptions(),
+          Map.class);
+      for (Map row : results) {
+        rows.add(mapMessageRecord(row));
+      }
+    } catch (Exception e) {
+      logger.error(
+          "Failed to list history conversationId={} fromSequenceId={} quantity={}",
+          conversationId,
+          fromSequenceId,
+          quantity,
+          e);
+    }
+    return rows;
+  }
+
+  /**
+   * Responsibility: update conversation activity timestamps after message
+   * persistence.
+   * Input: conversation id and persisted message timestamp.
+   * Output: true when update succeeds; false otherwise.
+   */
+
+  // TODO: is lastMessageAtMs in "conversation" needed?
+  public boolean touchConversation(String conversationId, long lastMessageAtMs) {
+    Optional<ConversationRecord> existing = findConversationById(conversationId);
+    if (existing.isEmpty()) {
+      return false;
+    }
+
+    ConversationRecord current = existing.get();
+    Map<String, Object> item = new HashMap<>();
+    item.put("id", current.conversationId());
+    item.put("conversationId", current.conversationId());
+    item.put("memberUserIds", current.memberUserIds());
+    item.put("createdAtMs", current.createdAtMs());
+    item.put("updatedAtMs", lastMessageAtMs);
+    item.put("lastMessageAtMs", lastMessageAtMs);
+
+    try {
+      conversationsContainer.upsertItem(item, new PartitionKey(current.conversationId()), null);
+      return true;
+    } catch (Exception e) {
+      logger.error("Failed to update conversation timestamps conversationId={}", conversationId, e);
+      return false;
+    }
+  }
 
   /**
    * Responsibility: quickly test whether a user id exists.
@@ -399,15 +601,6 @@ public class CosmosDBHandler {
       return record.get().email();
     }
     return record.get().userId();
-  }
-
-  /**
-   * Responsibility: build stable unordered pair key.
-   * Input: two user ids in any order.
-   * Output: lexicographically normalized key used as conversation identity input.
-   */
-  public String toPairKey(String userA, String userB) {
-    return userA.compareTo(userB) <= 0 ? userA + ":" + userB : userB + ":" + userA;
   }
 
   /**
@@ -441,6 +634,24 @@ public class CosmosDBHandler {
   }
 
   /**
+   * Responsibility: map raw conversation members into normalized user id list.
+   * Input: untyped member array from Cosmos document.
+   * Output: user id list (empty when missing).
+   */
+  private static List<String> asStringList(Object value) {
+    if (!(value instanceof List<?> rawList)) {
+      return List.of();
+    }
+    List<String> out = new ArrayList<>();
+    for (Object item : rawList) {
+      if (item instanceof String text && !text.isBlank()) {
+        out.add(text);
+      }
+    }
+    return out;
+  }
+
+  /**
    * Responsibility: map raw Cosmos document fields to typed conversation record.
    * Input: map row returned by Cosmos query/read.
    * Output: typed ConversationRecord.
@@ -448,13 +659,10 @@ public class CosmosDBHandler {
   private static ConversationRecord mapConversationRecord(Map<?, ?> row) {
     return new ConversationRecord(
         asString(row.get("id")),
-        // asString(row.get("pairKey")),
-        // asString(row.get("userA")),
-        // asString(row.get("userB")),
+        asStringList(row.get("memberUserIds")),
         asLong(row.get("createdAtMs")),
-        asLong(row.get("updatedAtMs"))
-        // asLong(row.get("lastMessageAtMs"))
-        );
+        asLong(row.get("updatedAtMs")),
+        asLong(row.get("lastMessageAtMs")));
   }
 
   /**
@@ -467,6 +675,7 @@ public class CosmosDBHandler {
         asString(row.get("serverMsgId")),
         asString(row.get("clientMsgId")),
         asString(row.get("conversationId")),
+        asLong(row.get("sequenceId")),
         asString(row.get("senderUserId")),
         asString(row.get("recipientUserId")),
         asString(row.get("text")),
@@ -489,29 +698,30 @@ public class CosmosDBHandler {
     }
   }
 
-  public record UserRecord(String userId, String email, String passwordHash) {}
+  public record UserRecord(String userId, String email, String passwordHash) {
+  }
 
   public record ConversationRecord(
       String conversationId,
-      // String pairKey,
-      // String userA,
-      // String userB,
+      List<String> memberUserIds,
       long createdAtMs,
-      long updatedAtMs
-      // long lastMessageAtMs
-      ) {}
+      long updatedAtMs,
+      long lastMessageAtMs) {
+  }
 
   public record MessageRecord(
       String serverMsgId,
       String clientMsgId,
       String conversationId,
+      long sequenceId,
       String senderUserId,
       String recipientUserId,
       String text,
       long sentAtMs,
       String status,
       long createdAtMs,
-      long updatedAtMs) {}
+      long updatedAtMs) {
+  }
 
   public enum PersistStatus {
     CREATED,
@@ -519,5 +729,6 @@ public class CosmosDBHandler {
     FAILED
   }
 
-  public record PersistResult(PersistStatus status, MessageRecord messageRecord, String errorReason) {}
+  public record PersistResult(PersistStatus status, MessageRecord messageRecord, String errorReason) {
+  }
 }

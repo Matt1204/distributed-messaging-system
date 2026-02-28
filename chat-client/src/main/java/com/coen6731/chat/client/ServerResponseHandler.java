@@ -1,7 +1,11 @@
 package com.coen6731.chat.client;
 
 import com.coen6731.chat.AuthSuccess;
+import com.coen6731.chat.CanonicalMessage;
+import com.coen6731.chat.CatchupConversationResult;
+import com.coen6731.chat.CatchupResult;
 import com.coen6731.chat.InboundMessage;
+import com.coen6731.chat.MsgHistoryResult;
 import com.coen6731.chat.SendMessageAck;
 import com.coen6731.chat.SendStatus;
 import com.coen6731.chat.ServerError;
@@ -10,6 +14,7 @@ import io.grpc.Status;
 import io.grpc.StatusRuntimeException;
 import io.grpc.stub.StreamObserver;
 import java.time.Instant;
+import java.util.List;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -28,6 +33,7 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
   private final Supplier<String> currentUserIdSupplier;
   private final Supplier<String> currentEmailSupplier;
   private final Supplier<ClientUiListener> uiListenerSupplier;
+  private final Runnable onReconnectCatchupReady;
 
   @FunctionalInterface
   public interface BiConsumerString {
@@ -48,7 +54,8 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
       BiConsumerString onAuthFailed,
       Supplier<String> currentUserIdSupplier,
       Supplier<String> currentEmailSupplier,
-      Supplier<ClientUiListener> uiListenerSupplier) {
+      Supplier<ClientUiListener> uiListenerSupplier,
+      Runnable onReconnectCatchupReady) {
     this.dbManagerSupplier = dbManagerSupplier;
     this.heartbeatManager = heartbeatManager;
     this.reconnectCallback = reconnectCallback;
@@ -58,6 +65,7 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
     this.currentUserIdSupplier = currentUserIdSupplier;
     this.currentEmailSupplier = currentEmailSupplier;
     this.uiListenerSupplier = uiListenerSupplier;
+    this.onReconnectCatchupReady = onReconnectCatchupReady;
   }
 
   /**
@@ -68,12 +76,19 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
   @Override
   public void onNext(ServerEvent value) {
     onConnectionHealthy.run();
+    onReconnectCatchupReady.run();
     switch (value.getPayloadCase()) {
       case INBOUNDMESSAGE:
         handleInboundMessage(value.getInboundMessage());
         break;
       case SENDMESSAGEACK:
         handleSendMessageAck(value.getSendMessageAck());
+        break;
+      case CATCHUPRESULT:
+        handleCatchupResult(value.getCatchupResult());
+        break;
+      case MSGHISTORYRESULT:
+        handleMsgHistoryResult(value.getMsgHistoryResult());
         break;
       case SERVERERROR:
         handleServerError(value.getServerError());
@@ -143,9 +158,9 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
   }
 
   /**
-   * Responsibility: persist inbound message and notify UI.
-   * Input: canonical inbound message payload.
-   * Output: local INBOUND row, conversation refresh, and chat callback.
+   * Responsibility: persist one live inbound message and advance cursor by sequence.
+   * Input: inbound message payload.
+   * Output: local write + cursor update + UI refresh.
    */
   private void handleInboundMessage(InboundMessage msg) {
     DatabaseManager dbManager = dbManagerSupplier.get();
@@ -162,16 +177,17 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
         msg.getServerMsgId(),
         safe(msg.getClientMsgId()),
         safe(msg.getConversationId()),
+        msg.getSequenceId(),
         safe(msg.getFromUserId()),
         senderEmail,
         safe(msg.getToUserId()),
         currentEmail,
         safe(msg.getText()),
         msg.getSentAtMs(),
-        SendStatus.PERSISTED_PENDING_DELIVERY.name()); // TODO: SQLite's inbound msg should always be "DELIVERED" or something
+        SendStatus.PERSISTED_PENDING_DELIVERY.name());
 
     if (!currentUserId.isBlank()) {
-      dbManager.updateLastSyncSequenceId(currentUserId, msg.getServerMsgId());
+      dbManager.advanceConversationCursorIfHigher(currentUserId, safe(msg.getConversationId()), msg.getSequenceId());
     }
 
     ClientUiListener listener = uiListenerSupplier.get();
@@ -189,7 +205,7 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
   /**
    * Responsibility: reconcile outbound provisional row with send ack result.
    * Input: send ack payload.
-   * Output: DB row update/delete and user-visible ack feedback.
+   * Output: DB row update/delete, cursor update, and user-visible ack feedback.
    */
   private void handleSendMessageAck(SendMessageAck ack) {
     DatabaseManager dbManager = dbManagerSupplier.get();
@@ -205,17 +221,131 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
           ack.getClientMsgId(),
           ack.getServerMsgId(),
           ack.getConversationId(),
+          ack.getSequenceId(),
           effectiveSentAt,
           ack.getStatus().name());
+
+      String currentUserId = safe(currentUserIdSupplier.get());
+      if (!currentUserId.isBlank()) {
+        dbManager.advanceConversationCursorIfHigher(currentUserId, ack.getConversationId(), ack.getSequenceId());
+      }
+
       notifySendAck(ack.getClientMsgId(), true, "", "");
       notifyConversationRefresh();
       return;
     }
 
-    // send failed path, delete the provisional outbound msg row
     dbManager.deleteOutboundByClientMsgId(ack.getClientMsgId());
     notifySendAck(ack.getClientMsgId(), false, ack.getErrorCode(), ack.getErrorReason());
     notifyConversationRefresh();
+  }
+
+  /**
+   * Responsibility: persist multi-conversation catchup payload and advance local cursors.
+   * Input: catchup result with per-conversation newest-first messages.
+   * Output: local idempotent writes, cursor updates, and one UI refresh.
+   */
+  private void handleCatchupResult(CatchupResult catchupResult) {
+    DatabaseManager dbManager = dbManagerSupplier.get();
+    if (dbManager == null) {
+      return;
+    }
+
+    String currentUserId = safe(currentUserIdSupplier.get());
+    String currentEmail = safe(currentEmailSupplier.get());
+    for (CatchupConversationResult conversationResult : catchupResult.getConversationResultsList()) {
+      List<CanonicalMessage> messages = conversationResult.getMessagesList();
+      for (CanonicalMessage message : messages) {
+        persistCanonicalMessage(dbManager, message, currentUserId, currentEmail);
+      }
+      if (!currentUserId.isBlank()) {
+        long highestPersistedSequenceId = maxPositiveSequenceId(messages);
+        if (highestPersistedSequenceId > 0) {
+          dbManager.upsertConversationCursor(
+              currentUserId,
+              conversationResult.getConversationId(),
+              highestPersistedSequenceId);
+        }
+      }
+      notifyCatchupResultSummary(
+          conversationResult.getConversationId(), minPositiveSequenceId(messages), messages.size());
+    }
+    notifyConversationRefresh();
+  }
+
+  /**
+   * Responsibility: persist one history page without advancing sync cursor.
+   * Input: history response for one conversation.
+   * Output: local idempotent writes and UI refresh.
+   */
+  private void handleMsgHistoryResult(MsgHistoryResult result) {
+    DatabaseManager dbManager = dbManagerSupplier.get();
+    if (dbManager == null) {
+      return;
+    }
+
+    String currentUserId = safe(currentUserIdSupplier.get());
+    String currentEmail = safe(currentEmailSupplier.get());
+    List<CanonicalMessage> messages = result.getMessagesList();
+    for (CanonicalMessage message : messages) {
+      persistCanonicalMessage(dbManager, message, currentUserId, currentEmail);
+    }
+    notifyHistoryResultSummary(result.getConversationId(), minPositiveSequenceId(messages), messages.size());
+    notifyConversationRefresh();
+  }
+
+  private long minPositiveSequenceId(List<CanonicalMessage> messages) {
+    long min = Long.MAX_VALUE;
+    for (CanonicalMessage message : messages) {
+      if (message.getSequenceId() > 0) {
+        min = Math.min(min, message.getSequenceId());
+      }
+    }
+    return min == Long.MAX_VALUE ? 0L : min;
+  }
+
+  private long maxPositiveSequenceId(List<CanonicalMessage> messages) {
+    long max = 0L;
+    for (CanonicalMessage message : messages) {
+      if (message.getSequenceId() > 0) {
+        max = Math.max(max, message.getSequenceId());
+      }
+    }
+    return max;
+  }
+
+  /**
+   * Responsibility: persist canonical message into a unified idempotent SQLite path.
+   * Input: canonical message and current authenticated user identity.
+   * Output: inserted-or-ignored local row.
+   */
+  private void persistCanonicalMessage(
+      DatabaseManager dbManager,
+      CanonicalMessage message,
+      String currentUserId,
+      String currentEmail) {
+    boolean isOutbound = !currentUserId.isBlank() && currentUserId.equals(message.getFromUserId());
+    String direction = isOutbound ? "OUTBOUND" : "INBOUND";
+    String senderEmail = safe(message.getFromEmail());
+    String recipientEmail = isOutbound ? "" : currentEmail;
+    String peerUserId = isOutbound ? safe(message.getToUserId()) : safe(message.getFromUserId());
+    String peerEmail = isOutbound ? "" : senderEmail;
+
+    dbManager.upsertCanonicalMessage(
+        safe(message.getClientMsgId()),
+        direction,
+        safe(message.getServerMsgId()),
+        safe(message.getConversationId()),
+        message.getSequenceId(),
+        safe(message.getFromUserId()),
+        senderEmail,
+        safe(message.getToUserId()),
+        recipientEmail,
+        safe(message.getText()),
+        message.getSentAtMs(),
+        SendStatus.PERSISTED_PENDING_DELIVERY.name(),
+        peerUserId,
+        peerEmail);
   }
 
   /**
@@ -259,6 +389,20 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
     }
   }
 
+  private void notifyHistoryResultSummary(String conversationId, long startSequenceId, int messageCount) {
+    ClientUiListener listener = uiListenerSupplier.get();
+    if (listener != null) {
+      listener.onHistoryResultSummary(conversationId, startSequenceId, messageCount);
+    }
+  }
+
+  private void notifyCatchupResultSummary(String conversationId, long startSequenceId, int messageCount) {
+    ClientUiListener listener = uiListenerSupplier.get();
+    if (listener != null) {
+      listener.onCatchupResultSummary(conversationId, startSequenceId, messageCount);
+    }
+  }
+
   /**
    * Responsibility: trigger conversation list/detail refresh in UI.
    * Input: none.
@@ -274,7 +418,7 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
   /**
    * Responsibility: normalize nullable string values.
    * Input: possibly null text.
-   * Output: non-null trimmed-safe string.
+   * Output: non-null safe string.
    */
   private String safe(String value) {
     return value == null ? "" : value;

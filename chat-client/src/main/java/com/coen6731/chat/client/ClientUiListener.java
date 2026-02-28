@@ -18,5 +18,9 @@ public interface ClientUiListener {
 
   void onConversationDataChanged();
 
+  void onHistoryResultSummary(String conversationId, long startSequenceId, int messageCount);
+
+  void onCatchupResultSummary(String conversationId, long startSequenceId, int messageCount);
+
   void onError(String code, String reason);
 }

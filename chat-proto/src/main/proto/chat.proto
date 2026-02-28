@@ -18,7 +18,8 @@ message ClientEvent {
     RegisterUser registerUser = 2;
     OutboundMessage outboundMessage = 3;
     HeartbeatPing heartbeatPing = 4;
-    Catchup catchup = 5;
+    CatchupRequest catchupRequest = 5;
+    GetMsgHistoryRequest getMsgHistoryRequest = 6;
   }
 }
 
@@ -27,10 +28,11 @@ message ServerEvent {
   oneof payload {
     InboundMessage inboundMessage = 1;
     ServerError serverError = 2;
-    CatchupComplete catchupComplete = 3;
+    CatchupResult catchupResult = 3;
     HeartbeatPong heartbeatPong = 4;
     AuthSuccess authSuccess = 5;
     SendMessageAck sendMessageAck = 6;
+    MsgHistoryResult msgHistoryResult = 7;
   }
 }
 
@@ -62,13 +64,36 @@ message HeartbeatPing {
   int64 ts = 1;
 }
 
-message Catchup {
-  string userId = 1;
-  int64 lastSyncSequenceId = 2;
+message CatchupRequest {
+  repeated ConversationCursor cursorHints = 1;
+  int32 perConversationLimit = 2;
+}
+
+message ConversationCursor {
+  string conversationId = 1;
+  int64 clientLastReceivedSequenceId = 2;
+}
+
+message GetMsgHistoryRequest {
+  string conversationId = 1;
+  int64 beforeSequenceId = 2;
+  int32 retriveMsgQuantity = 3;
 }
 
 // ------------------------------------------------------------------------------------------------
 // server messages
+
+message CanonicalMessage {
+  string serverMsgId = 1;
+  string clientMsgId = 2;
+  string conversationId = 3;
+  int64 sequenceId = 4;
+  string fromUserId = 5;
+  string fromEmail = 6;
+  string toUserId = 7;
+  string text = 8;
+  int64 sentAtMs = 9;
+}
 
 // Canonical message payload delivered to recipients.
 message InboundMessage {
@@ -80,6 +105,7 @@ message InboundMessage {
   string toUserId = 6;
   string text = 7;
   int64 sentAtMs = 8;
+  int64 sequenceId = 9;
 }
 
 // Outbound send status reported back to sender.
@@ -91,6 +117,23 @@ message SendMessageAck {
   string errorCode = 5;
   string errorReason = 6;
   int64 ackTs = 7;
+  int64 sequenceId = 8;
+}
+
+message CatchupConversationResult {
+  string conversationId = 1;
+  int64 conversationLatestSequenceId = 2;
+  repeated CanonicalMessage messages = 3;
+}
+
+message CatchupResult {
+  repeated CatchupConversationResult conversationResults = 1;
+  int64 generatedAtMs = 2;
+}
+
+message MsgHistoryResult {
+  string conversationId = 1;
+  repeated CanonicalMessage messages = 2;
 }
 
 // Message persistence/delivery state for sender reconciliation.
@@ -104,11 +147,6 @@ enum SendStatus {
 message ServerError {
   string code = 1;
   string reason = 2;
-}
-
-message CatchupComplete {
-  string userId = 1;
-  int64 truthSequenceId = 2;
 }
 
 message HeartbeatPong {

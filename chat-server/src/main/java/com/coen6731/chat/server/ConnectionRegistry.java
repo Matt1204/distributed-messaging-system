@@ -157,6 +157,7 @@ public class ConnectionRegistry {
                 .setToUserId(toUserId)
                 .setText(asString(streamMessageRecord.get("text")))
                 .setSentAtMs(asLong(streamMessageRecord.get("sentAtMs")))
+                .setSequenceId(asLong(streamMessageRecord.get("sequenceId")))
                 .build();
 
         session.send(ServerEvent.newBuilder().setInboundMessage(inboundMessage).build());
@@ -198,6 +199,7 @@ public class ConnectionRegistry {
     streamMessageRecord.put("fromEmail", message.getFromEmail());
     streamMessageRecord.put("text", message.getText());
     streamMessageRecord.put("sentAtMs", String.valueOf(message.getSentAtMs()));
+    streamMessageRecord.put("sequenceId", String.valueOf(message.getSequenceId()));
 
     redisHandler.publishRelayMessage(targetInstanceId, streamMessageRecord);
   }

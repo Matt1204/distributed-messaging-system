@@ -1,12 +1,19 @@
 package com.coen6731.chat.server;
 
 import com.coen6731.chat.AuthSuccess;
+import com.coen6731.chat.CanonicalMessage;
+import com.coen6731.chat.CatchupConversationResult;
+import com.coen6731.chat.CatchupRequest;
+import com.coen6731.chat.CatchupResult;
 import com.coen6731.chat.ClientEvent;
+import com.coen6731.chat.ConversationCursor;
+import com.coen6731.chat.GetMsgHistoryRequest;
 import com.coen6731.chat.HeartbeatPing;
 import com.coen6731.chat.HeartbeatPong;
 import com.coen6731.chat.InboundMessage;
 import com.coen6731.chat.LoginUser;
 import com.coen6731.chat.MessagingServiceGrpc;
+import com.coen6731.chat.MsgHistoryResult;
 import com.coen6731.chat.OutboundMessage;
 import com.coen6731.chat.RegisterUser;
 import com.coen6731.chat.SendMessageAck;
@@ -17,6 +24,10 @@ import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import org.slf4j.Logger;
@@ -26,8 +37,8 @@ import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Component;
 
 /**
- * Responsibility: gRPC stream handler for auth, heartbeat, and chat send
- * workflows.
+ * Responsibility: gRPC stream handler for auth, heartbeat, send, catchup, and
+ * history workflows.
  * Input: streaming ClientEvent messages.
  * Output: streaming ServerEvent messages.
  */
@@ -43,9 +54,12 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
   private static final String ERROR_CONVERSATION_INVALID = "CONVERSATION_INVALID";
   private static final String ERROR_PERSISTENCE_FAILED = "PERSISTENCE_FAILED";
   private static final int MAX_TEXT_LENGTH = 4096;
+  private static final int FALLBACK_CATCHUP_LIMIT = 50;
+  private static final int MAX_PAGE_LIMIT = 200;
 
   private final ConnectionRegistry connectionRegistry;
   private final CosmosDBHandler cosmosDBHandler;
+  private final RedisHandler redisHandler;
   private final PasswordEncoder passwordEncoder;
 
   @org.springframework.beans.factory.annotation.Value("${container.app.replica.name}")
@@ -53,12 +67,16 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
 
   /**
    * Responsibility: create service dependencies.
-   * Input: connection registry and cosmos repository.
+   * Input: connection registry, cosmos repository, and redis handler.
    * Output: initialized service instance.
    */
-  public MessagingServiceImpl(ConnectionRegistry registry, CosmosDBHandler cosmosDBHandler) {
+  public MessagingServiceImpl(
+      ConnectionRegistry registry,
+      CosmosDBHandler cosmosDBHandler,
+      RedisHandler redisHandler) {
     this.connectionRegistry = registry;
     this.cosmosDBHandler = cosmosDBHandler;
+    this.redisHandler = redisHandler;
     this.passwordEncoder = new BCryptPasswordEncoder();
   }
 
@@ -123,6 +141,12 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
           case OUTBOUNDMESSAGE:
             // client -> server: send message
             handleSendMessage(event.getOutboundMessage());
+            break;
+          case CATCHUPREQUEST:
+            handleCatchupRequest(event.getCatchupRequest());
+            break;
+          case GETMSGHISTORYREQUEST:
+            handleGetMsgHistoryRequest(event.getGetMsgHistoryRequest());
             break;
           case PAYLOAD_NOT_SET:
           default:
@@ -263,12 +287,13 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
         Optional<CosmosDBHandler.UserRecord> recipientUserRec = cosmosDBHandler.findUserByEmail(toEmail);
         if (recipientUserRec.isEmpty()) {
           sendMessageAck(
-              buildFailedAck(clientMsgId, "", "", ERROR_RECIPIENT_NOT_FOUND, "recipient email not found"));
+              buildFailedAck(clientMsgId, "", "", 0L, ERROR_RECIPIENT_NOT_FOUND, "recipient email not found"));
           return;
         }
         String recipientUserId = recipientUserRec.get().userId();
 
-        Optional<CosmosDBHandler.ConversationRecord> conversationOpt = resolveConversationId(outboundMessage.getConversationId());
+        Optional<CosmosDBHandler.ConversationRecord> conversationOpt = resolveConversationId(
+            outboundMessage.getConversationId(), recipientUserId);
 
         if (conversationOpt.isEmpty()) {
           sendMessageAck(
@@ -276,23 +301,36 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
                   clientMsgId,
                   "",
                   safeTrim(outboundMessage.getConversationId()),
+                  0L,
                   ERROR_CONVERSATION_INVALID,
                   "failed to resolve conversation"));
           return;
         }
         CosmosDBHandler.ConversationRecord conversation = conversationOpt.get();
 
-        // generate new serverMsgId for this outbound message.
+        // the incremented sequenceId for new message
+        long sequenceId = allocateNextSequenceId(conversation.conversationId());
+        if (sequenceId <= 0) {
+          sendMessageAck(
+              buildFailedAck(
+                  clientMsgId,
+                  "",
+                  conversation.conversationId(),
+                  0L,
+                  ERROR_INTERNAL,
+                  "failed to allocate sequence id"));
+          return;
+        }
+
         String serverMsgId = deriveServerMsgId(effectiveUserId, clientMsgId);
         CosmosDBHandler.MessageRecord persistedMessage = persistMessage(clientMsgId, serverMsgId,
-            conversation.conversationId(), recipientUserId, text);
+            conversation.conversationId(), sequenceId, recipientUserId, text);
 
         if (persistedMessage == null) {
           return;
         }
 
-        // cosmosDBHandler.touchConversation(conversation.conversationId(),
-        // persistedMessage.sentAtMs());
+        cosmosDBHandler.touchConversation(conversation.conversationId(), persistedMessage.sentAtMs());
 
         sendMessageAck(
             SendMessageAck.newBuilder()
@@ -301,6 +339,7 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
                 .setConversationId(persistedMessage.conversationId())
                 .setStatus(SendStatus.PERSISTED_PENDING_DELIVERY)
                 .setAckTs(persistedMessage.sentAtMs())
+                .setSequenceId(persistedMessage.sequenceId())
                 .build());
 
         InboundMessage inboundMessage = InboundMessage.newBuilder()
@@ -312,30 +351,163 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
             .setToUserId(persistedMessage.recipientUserId())
             .setText(persistedMessage.text())
             .setSentAtMs(persistedMessage.sentAtMs())
+            .setSequenceId(persistedMessage.sequenceId())
             .build();
 
         deliverLiveMessage(recipientUserId, toEmail, inboundMessage);
       }
 
+      /**
+       * Responsibility: reconcile missed conversation messages for authenticated
+       * user.
+       * Input: catchup cursor hints and per-conversation page limit.
+       * Output: one catchup result event with per-conversation message batches.
+       */
+      private void handleCatchupRequest(CatchupRequest request) {
+        if (!validateAuthenticatedForGeneralRequest()) {
+          return;
+        }
+
+        int limit = normalizeLimit(request.getPerConversationLimit(), FALLBACK_CATCHUP_LIMIT);
+        // Client-provided catchup hints: {conversationId -> clientLastReceivedSequenceId}.
+        Map<String, Long> clientConversationSeqMap = new HashMap<>();
+        for (ConversationCursor cursor : request.getCursorHintsList()) {
+          String conversationId = safeTrim(cursor.getConversationId());
+          if (!conversationId.isBlank()) {
+            clientConversationSeqMap.put(conversationId, Math.max(0L, cursor.getClientLastReceivedSequenceId()));
+          }
+        }
+
+        Map<String, String> emailCache = new HashMap<>();
+        CatchupResult.Builder resultBuilder = CatchupResult.newBuilder();
+
+        // Catch up all conversations the user can access.
+        List<CosmosDBHandler.ConversationRecord> authorizedConversations = cosmosDBHandler
+            .findConversationsByMember(effectiveUserId);
+        authorizedConversations.sort(Comparator.comparingLong(CosmosDBHandler.ConversationRecord::lastMessageAtMs)
+            .reversed());
+
+        for (CosmosDBHandler.ConversationRecord conversation : authorizedConversations) {
+          String conversationId = conversation.conversationId();
+          // Client state for this conversation.
+          long clientConversationSeq = Math.max(0L, clientConversationSeqMap.getOrDefault(conversationId, 0L));
+          // Durable latest message sequence id on the server (must map to a real stored message).
+          long serverConversationSeq = cosmosDBHandler.findMaxSequenceId(conversationId);
+
+          CatchupConversationResult.Builder convResult = CatchupConversationResult.newBuilder()
+              .setConversationId(conversationId)
+              .setConversationLatestSequenceId(serverConversationSeq);
+
+          // Newest-first catchup: only return this conversation's latest missing window.
+          if (clientConversationSeq < serverConversationSeq && limit > 0) {
+            List<CosmosDBHandler.MessageRecord> newestMissing = cosmosDBHandler.listNewestMessagesAfterSequence(
+                conversationId,
+                clientConversationSeq,
+                limit);
+            for (CosmosDBHandler.MessageRecord record : newestMissing) {
+              convResult.addMessages(toCanonicalMessage(record, emailCache));
+            }
+          }
+
+          resultBuilder.addConversationResults(convResult.build());
+        }
+
+        resultBuilder.setGeneratedAtMs(Instant.now().toEpochMilli());
+        session.send(ServerEvent.newBuilder().setCatchupResult(resultBuilder.build()).build());
+      }
+
+      /**
+       * Responsibility: return older conversation history page for one authorized
+       * conversation.
+       * Input: conversation id, before-sequence cursor, and requested page size.
+       * Output: one history result event with canonical messages.
+       */
+      private void handleGetMsgHistoryRequest(GetMsgHistoryRequest request) {
+        if (!validateAuthenticatedForGeneralRequest()) {
+          return;
+        }
+
+        String conversationId = safeTrim(request.getConversationId());
+        if (conversationId.isBlank()) {
+          sendError(ERROR_BAD_REQUEST, "conversationId is required");
+          return;
+        }
+
+        Optional<CosmosDBHandler.ConversationRecord> conversationOpt = cosmosDBHandler
+            .findConversationById(conversationId);
+        if (conversationOpt.isEmpty() || !conversationOpt.get().memberUserIds().contains(effectiveUserId)) {
+          sendError(ERROR_CONVERSATION_INVALID, "conversation is not accessible");
+          return;
+        }
+
+        long beforeSequenceId = request.getBeforeSequenceId();
+        if (beforeSequenceId <= 0L) {
+          sendError(ERROR_BAD_REQUEST, "beforeSequenceId must be > 0");
+          return;
+        }
+
+        int retriveMsgQuantity = request.getRetriveMsgQuantity();
+        if (retriveMsgQuantity <= 0) {
+          sendError(ERROR_BAD_REQUEST, "retriveMsgQuantity is required and must be > 0");
+          return;
+        }
+        int boundedQuantity = Math.min(retriveMsgQuantity, MAX_PAGE_LIMIT);
+        List<CosmosDBHandler.MessageRecord> history = cosmosDBHandler.listMessagesFromSequenceDescending(
+            conversationId,
+            beforeSequenceId,
+            boundedQuantity);
+
+        Map<String, String> emailCache = new HashMap<>();
+        MsgHistoryResult.Builder result = MsgHistoryResult.newBuilder().setConversationId(conversationId);
+        for (CosmosDBHandler.MessageRecord record : history) {
+          result.addMessages(toCanonicalMessage(record, emailCache));
+        }
+
+        session.send(ServerEvent.newBuilder().setMsgHistoryResult(result.build()).build());
+      }
+
+      /**
+       * Responsibility: validate sender identity exists for send workflow.
+       * Input: outbound client message id.
+       * Output: true when authenticated and allowed to send.
+       */
       private boolean validateSender(String clientMsgId) {
         if (!isAuthenticated || effectiveUserId == null || effectiveUserId.isBlank()) {
-          sendMessageAck(buildFailedAck(clientMsgId, "", "", ERROR_AUTH_NOT_AUTHENTICATED, "Authenticate first"));
+          sendMessageAck(buildFailedAck(clientMsgId, "", "", 0L, ERROR_AUTH_NOT_AUTHENTICATED, "Authenticate first"));
           return false;
         }
         return true;
       }
 
+      /**
+       * Responsibility: validate stream authentication for non-send APIs.
+       * Input: none.
+       * Output: true when authenticated, false after error event.
+       */
+      private boolean validateAuthenticatedForGeneralRequest() {
+        if (!isAuthenticated || effectiveUserId == null || effectiveUserId.isBlank()) {
+          sendError(ERROR_AUTH_NOT_AUTHENTICATED, "Authenticate first");
+          return false;
+        }
+        return true;
+      }
+
+      /**
+       * Responsibility: validate recipient/text/client ids before persistence.
+       * Input: outbound fields from sender request.
+       * Output: true when input is valid.
+       */
       private boolean validateMessageContent(String clientMsgId, String toEmail, String text) {
         if (toEmail.isBlank()) {
-          sendMessageAck(buildFailedAck(clientMsgId, "", "", ERROR_BAD_REQUEST, "toEmail is required"));
+          sendMessageAck(buildFailedAck(clientMsgId, "", "", 0L, ERROR_BAD_REQUEST, "toEmail is required"));
           return false;
         }
         if (clientMsgId.isBlank()) {
-          sendMessageAck(buildFailedAck("", "", "", ERROR_BAD_REQUEST, "clientMsgId is required"));
+          sendMessageAck(buildFailedAck("", "", "", 0L, ERROR_BAD_REQUEST, "clientMsgId is required"));
           return false;
         }
         if (text.isBlank()) {
-          sendMessageAck(buildFailedAck(clientMsgId, "", "", ERROR_BAD_REQUEST, "text is required"));
+          sendMessageAck(buildFailedAck(clientMsgId, "", "", 0L, ERROR_BAD_REQUEST, "text is required"));
           return false;
         }
         if (text.length() > MAX_TEXT_LENGTH) {
@@ -344,6 +516,7 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
                   clientMsgId,
                   "",
                   "",
+                  0L,
                   ERROR_BAD_REQUEST,
                   "text exceeds max length " + MAX_TEXT_LENGTH));
           return false;
@@ -351,14 +524,26 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
         return true;
       }
 
-      private CosmosDBHandler.MessageRecord persistMessage(String clientMsgId, String serverMsgId,
-          String conversationId, String recipientUserId, String text) {
+      /**
+       * Responsibility: persist canonical message and reconcile idempotent duplicate
+       * writes.
+       * Input: canonical ids, routing ids, sequence id, and content.
+       * Output: persisted message record, or null after failed ack.
+       */
+      private CosmosDBHandler.MessageRecord persistMessage(
+          String clientMsgId,
+          String serverMsgId,
+          String conversationId,
+          long sequenceId,
+          String recipientUserId,
+          String text) {
         long nowMs = Instant.now().toEpochMilli();
 
-        CosmosDBHandler.MessageRecord NewMsgCandidate = new CosmosDBHandler.MessageRecord(
+        CosmosDBHandler.MessageRecord newMsgCandidate = new CosmosDBHandler.MessageRecord(
             serverMsgId,
             clientMsgId,
             conversationId,
+            sequenceId,
             effectiveUserId,
             recipientUserId,
             text,
@@ -367,7 +552,7 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
             nowMs,
             nowMs);
 
-        CosmosDBHandler.PersistResult persistResult = cosmosDBHandler.createMessageIfAbsent(NewMsgCandidate);
+        CosmosDBHandler.PersistResult persistResult = cosmosDBHandler.createMessageIfAbsent(newMsgCandidate);
         if (persistResult.status() == CosmosDBHandler.PersistStatus.CREATED) {
           return persistResult.messageRecord();
         } else if (persistResult.status() == CosmosDBHandler.PersistStatus.ALREADY_EXISTS) {
@@ -378,6 +563,7 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
                     clientMsgId,
                     serverMsgId,
                     conversationId,
+                    sequenceId,
                     ERROR_PERSISTENCE_FAILED,
                     "message conflict without existing record"));
             return null;
@@ -389,6 +575,7 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
                   clientMsgId,
                   serverMsgId,
                   conversationId,
+                  sequenceId,
                   ERROR_PERSISTENCE_FAILED,
                   Optional.ofNullable(persistResult.errorReason()).orElse("persist failed")));
           return null;
@@ -396,14 +583,75 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
       }
 
       /**
-       * Responsibility: resolve conversation by explicit id or create a new one.
-       * Input: optional conversationId and sender/recipient user ids.
+       * Responsibility: resolve conversation by explicit id or create a member-scoped
+       * one.
+       * Input: optional conversation id and recipient user id.
        * Output: existing or newly created conversation record.
        */
-      private Optional<CosmosDBHandler.ConversationRecord> resolveConversationId(String requestedConversationId) {
+      private Optional<CosmosDBHandler.ConversationRecord> resolveConversationId(
+          String requestedConversationId,
+          String recipientUserId) {
         String normalizedReqConversationId = safeTrim(requestedConversationId);
         return cosmosDBHandler.createConversationIfAbsent(
-            normalizedReqConversationId, Instant.now().toEpochMilli());
+            normalizedReqConversationId,
+            effectiveUserId,
+            recipientUserId,
+            Instant.now().toEpochMilli());
+      }
+
+      /**
+       * Responsibility: allocate next monotonic sequence id for one conversation.
+       * Input: conversation id.
+       * Output: newly allocated sequence id.
+       */
+      private long allocateNextSequenceId(String conversationId) {
+        Long redisCursor = redisHandler.getConversationLatestSequenceId(conversationId);
+        // If redis 
+        if (redisCursor == null) {
+          long durableMax = cosmosDBHandler.findMaxSequenceId(conversationId);
+          redisHandler.initializeConversationSequenceIfAbsent(conversationId, durableMax);
+        }
+        return redisHandler.incrementConversationSequence(conversationId);
+      }
+
+      /**
+       * Responsibility: map durable message record to shared canonical payload.
+       * Input: message record plus sender-email cache map.
+       * Output: canonical message sent by catchup/history APIs.
+       */
+      private CanonicalMessage toCanonicalMessage(
+          CosmosDBHandler.MessageRecord record,
+          Map<String, String> emailCache) {
+        String fromEmail = emailCache.computeIfAbsent(
+            record.senderUserId(),
+            userId -> {
+              Optional<CosmosDBHandler.UserRecord> user = cosmosDBHandler.findUserByUserId(userId);
+              return user.map(CosmosDBHandler.UserRecord::email).orElse("");
+            });
+
+        return CanonicalMessage.newBuilder()
+            .setServerMsgId(safeTrim(record.serverMsgId()))
+            .setClientMsgId(safeTrim(record.clientMsgId()))
+            .setConversationId(safeTrim(record.conversationId()))
+            .setSequenceId(record.sequenceId())
+            .setFromUserId(safeTrim(record.senderUserId()))
+            .setFromEmail(fromEmail)
+            .setToUserId(safeTrim(record.recipientUserId()))
+            .setText(safeTrim(record.text()))
+            .setSentAtMs(record.sentAtMs())
+            .build();
+      }
+
+      /**
+       * Responsibility: normalize requested page limits to configured bounds.
+       * Input: requested limit and default fallback.
+       * Output: bounded positive page size.
+       */
+      private int normalizeLimit(int requestedLimit, int defaultValue) {
+        if (requestedLimit <= 0) {
+          return defaultValue;
+        }
+        return Math.min(requestedLimit, MAX_PAGE_LIMIT);
       }
 
       /**
@@ -429,12 +677,13 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
         if (localUserSession != null) {
           localUserSession.send(ServerEvent.newBuilder().setInboundMessage(message).build());
           logger.info(
-              "[{}] live-delivered local sender={} recipient={} serverMsgId={} conversationId={}",
+              "[{}] live-delivered local sender={} recipient={} serverMsgId={} conversationId={} sequenceId={}",
               serverReplicaId,
               message.getFromUserId(),
               toUserId,
               message.getServerMsgId(),
-              message.getConversationId());
+              message.getConversationId(),
+              message.getSequenceId());
           return;
         }
 
@@ -446,24 +695,26 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
             String targetSessionId = parts[1];
             connectionRegistry.ReplayMessageToNode(targetInstanceId, toUserId, targetSessionId, message);
             logger.info(
-                "[{}] live-relayed sender={} recipientEmail={} targetInstance={} serverMsgId={} conversationId={}",
+                "[{}] live-relayed sender={} recipientEmail={} targetInstance={} serverMsgId={} conversationId={} sequenceId={}",
                 serverReplicaId,
                 message.getFromUserId(),
                 toEmail,
                 targetInstanceId,
                 message.getServerMsgId(),
-                message.getConversationId());
+                message.getConversationId(),
+                message.getSequenceId());
             return;
           }
         }
 
         logger.info(
-            "[{}] recipient offline sender={} recipient={} serverMsgId={} conversationId={}",
+            "[{}] recipient offline sender={} recipient={} serverMsgId={} conversationId={} sequenceId={}",
             serverReplicaId,
             message.getFromUserId(),
             toUserId,
             message.getServerMsgId(),
-            message.getConversationId());
+            message.getConversationId(),
+            message.getSequenceId());
       }
 
       /**
@@ -506,19 +757,21 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
 
       /**
        * Responsibility: build failure ack payload for validation/persistence errors.
-       * Input: ids and error metadata.
+       * Input: ids, optional sequence id, and error metadata.
        * Output: send ack with FAILED status.
        */
       private SendMessageAck buildFailedAck(
           String clientMsgId,
           String serverMsgId,
           String conversationId,
+          long sequenceId,
           String errorCode,
           String errorReason) {
         return SendMessageAck.newBuilder()
             .setClientMsgId(clientMsgId == null ? "" : clientMsgId)
             .setServerMsgId(serverMsgId == null ? "" : serverMsgId)
             .setConversationId(conversationId == null ? "" : conversationId)
+            .setSequenceId(Math.max(0L, sequenceId))
             .setStatus(SendStatus.FAILED)
             .setErrorCode(errorCode == null ? ERROR_INTERNAL : errorCode)
             .setErrorReason(errorReason == null ? "unknown send error" : errorReason)

@@ -30,6 +30,7 @@ import org.springframework.stereotype.Component;
 public class RedisHandler {
   private static final Logger logger = LoggerFactory.getLogger(RedisHandler.class);
   private static final String ONLINE_USER_KEY_PREFIX = "user:online:";
+  private static final String CONVERSATION_SEQ_KEY_PREFIX = "conversation:latest_msg_sequenceId:";
   private static final String STREAM_KEY_PREFIX = "stream:instance:";
   private static final String GROUP_PREFIX = "cg:";
   private static final String CONSUMER_PREFIX = "consumer:";
@@ -127,6 +128,44 @@ public class RedisHandler {
    */
   public String getUserOnlineInfo(String userId) {
     return redisTemplate.opsForValue().get(ONLINE_USER_KEY_PREFIX + userId);
+  }
+
+  /**
+   * Responsibility: read latest authoritative sequence cursor for one conversation.
+   * Input: conversation id.
+   * Output: Redis cursor value or null when key is absent.
+   */
+  public Long getConversationLatestSequenceId(String conversationId) {
+    String value = redisTemplate.opsForValue().get(CONVERSATION_SEQ_KEY_PREFIX + conversationId);
+    if (value == null || value.isBlank()) {
+      return null;
+    }
+    try {
+      return Long.parseLong(value);
+    } catch (NumberFormatException ignored) {
+      return null;
+    }
+  }
+
+  /**
+   * Responsibility: initialize conversation cursor only when absent.
+   * Input: conversation id and durable max sequence fallback.
+   * Output: true when initialization happened, false when key already exists.
+   */
+  public boolean initializeConversationSequenceIfAbsent(String conversationId, long sequenceId) {
+    Boolean applied =
+        redisTemplate.opsForValue().setIfAbsent(CONVERSATION_SEQ_KEY_PREFIX + conversationId, String.valueOf(sequenceId));
+    return Boolean.TRUE.equals(applied);
+  }
+
+  /**
+   * Responsibility: atomically allocate next sequence id for one conversation.
+   * Input: conversation id.
+   * Output: incremented sequence id or 0 when Redis returns null unexpectedly.
+   */
+  public long incrementConversationSequence(String conversationId) {
+    Long next = redisTemplate.opsForValue().increment(CONVERSATION_SEQ_KEY_PREFIX + conversationId);
+    return next == null ? 0L : next;
   }
 
   /**

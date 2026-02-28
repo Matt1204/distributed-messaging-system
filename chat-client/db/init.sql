@@ -29,6 +29,13 @@ CREATE INDEX idx_conversations_last_message_at ON conversations(last_message_at 
 CREATE TABLE user_state (
     user_id TEXT PRIMARY KEY,
     email TEXT,
-    user_name TEXT,
-    last_sync_sequence_id TEXT
+    user_name TEXT
+);
+
+CREATE TABLE local_conversation_cursor (
+    user_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    latest_message_sequence_id INTEGER NOT NULL DEFAULT 0,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(user_id, conversation_id)
 );

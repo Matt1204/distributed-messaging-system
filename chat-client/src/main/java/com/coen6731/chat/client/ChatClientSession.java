@@ -1,7 +1,10 @@
 package com.coen6731.chat.client;
 
 import com.coen6731.chat.AuthSuccess;
+import com.coen6731.chat.CatchupRequest;
 import com.coen6731.chat.ClientEvent;
+import com.coen6731.chat.ConversationCursor;
+import com.coen6731.chat.GetMsgHistoryRequest;
 import com.coen6731.chat.LoginUser;
 import com.coen6731.chat.MessagingServiceGrpc;
 import com.coen6731.chat.OutboundMessage;
@@ -15,6 +18,8 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -31,6 +36,7 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 public class ChatClientSession {
   private final String target;
+  private final boolean isProd;
   private volatile DatabaseManager dbManager;
   private volatile String currentUserId;
   private volatile String currentEmail;
@@ -45,6 +51,7 @@ public class ChatClientSession {
   private final AtomicBoolean isReconnecting = new AtomicBoolean(false);
   private final AtomicBoolean isClosing = new AtomicBoolean(false);
   private final AtomicBoolean isAuthenticated = new AtomicBoolean(false);
+  private final AtomicBoolean catchupPendingAfterReconnect = new AtomicBoolean(false);
 
   private final AtomicReference<CountDownLatch> authLatchRef = new AtomicReference<>();
   private volatile boolean lastAuthAttemptSuccess = false;
@@ -53,14 +60,17 @@ public class ChatClientSession {
 
   private volatile int reconnectDelayMs = 1000;
   private static final int MAX_RECONNECT_DELAY_MS = 5000;
+  private final int catchupPerConversationLimit;
 
   /**
    * Responsibility: create session object and start initial connect attempt.
    * Input: grpc target endpoint.
    * Output: live connection startup.
    */
-  public ChatClientSession(String target) {
+  public ChatClientSession(String target, int catchupPerConversationLimit, boolean isProd) {
     this.target = target;
+    this.isProd = isProd;
+    this.catchupPerConversationLimit = normalizePositiveLimit(catchupPerConversationLimit, 50, 200);
     this.scheduler = Executors.newScheduledThreadPool(2);
 
     this.heartbeatManager = new HeartbeatManager(scheduler, this::triggerReconnect);
@@ -110,9 +120,13 @@ public class ChatClientSession {
               this::onAuthFailed,
               () -> this.currentUserId,
               () -> this.currentEmail,
-              () -> this.uiListener);
+              () -> this.uiListener,
+              this::handleCatchupRequestAfterConnect);
 
       this.requestObserver = stub.chat(responseHandler);
+      if (isAuthenticated.get()) {
+        catchupPendingAfterReconnect.set(true);
+      }
       heartbeatManager.start();
       notifyInfo("[client] Connection initiated... waiting for server response.");
     } catch (Exception e) {
@@ -133,6 +147,7 @@ public class ChatClientSession {
     }
     heartbeatManager.resetMissedPongs();
     reconnectDelayMs = 1000;
+    handleCatchupRequestAfterConnect();
   }
 
   /**
@@ -161,7 +176,85 @@ public class ChatClientSession {
             + currentUserId
             + ")");
     notifyAuthState(true, currentEmail, null);
+    sendCatchupRequest();
     notifyConversationDataChanged();
+  }
+
+  /**
+   * Responsibility: request catchup once after a header-authenticated reconnect becomes healthy.
+   * Input: connection-health callback state.
+   * Output: one catchup request per reconnect cycle.
+   */
+  private void handleCatchupRequestAfterConnect() {
+    if (!isAuthenticated.get()) {
+      return;
+    }
+    if (catchupPendingAfterReconnect.compareAndSet(true, false)) {
+      sendCatchupRequest();
+    }
+  }
+
+  /**
+   * Responsibility: send one catchup request using local per-conversation cursor hints.
+   * Input: current authenticated user id and local cursor snapshot.
+   * Output: catchup request event on active grpc stream.
+   */
+  public void sendCatchupRequest() {
+    if (!isAuthenticated.get() || requestObserver == null || currentUserId == null || currentUserId.isBlank()) {
+      return;
+    }
+
+    CatchupRequest.Builder request =
+        CatchupRequest.newBuilder().setPerConversationLimit(catchupPerConversationLimit);
+    DatabaseManager localDb = dbManager;
+    if (localDb != null) {
+      Map<String, Long> cursorMap = localDb.listConversationCursors(currentUserId);
+      for (Map.Entry<String, Long> entry : cursorMap.entrySet()) {
+        request.addCursorHints(
+            ConversationCursor.newBuilder()
+                .setConversationId(entry.getKey())
+                .setClientLastReceivedSequenceId(Math.max(0L, entry.getValue()))
+                .build());
+      }
+    }
+
+    try {
+      requestObserver.onNext(ClientEvent.newBuilder().setCatchupRequest(request.build()).build());
+      notifyInfo("[client] Catchup requested.");
+    } catch (Exception e) {
+      notifyInfo("[client] Failed to request catchup: " + e.getMessage());
+    }
+  }
+
+  /**
+   * Responsibility: request older messages for one conversation before a sequence cursor.
+   * Input: conversation id, before-sequence cursor, and page size.
+   * Output: history request event on stream.
+   */
+  public void requestMessageHistory(String conversationId, long beforeSequenceId, int limit) {
+    if (!isAuthenticated.get() || requestObserver == null || conversationId == null || conversationId.isBlank()) {
+      return;
+    }
+    int boundedLimit = normalizePositiveLimit(limit, 50, 200);
+    long boundedBeforeSequenceId = Math.max(1L, beforeSequenceId);
+    GetMsgHistoryRequest request =
+        GetMsgHistoryRequest.newBuilder()
+            .setConversationId(conversationId)
+            .setBeforeSequenceId(boundedBeforeSequenceId)
+            .setRetriveMsgQuantity(boundedLimit)
+            .build();
+    try {
+      requestObserver.onNext(ClientEvent.newBuilder().setGetMsgHistoryRequest(request).build());
+      notifyInfo(
+          "[client] history requested conv="
+              + conversationId
+              + " beforeSequenceId="
+              + boundedBeforeSequenceId
+              + " quantity="
+              + boundedLimit);
+    } catch (Exception e) {
+      notifyInfo("[client] Failed to request history: " + e.getMessage());
+    }
   }
 
   /**
@@ -179,12 +272,10 @@ public class ChatClientSession {
 
     this.dbManager = new DatabaseManager(perUserDbPath);
 
+    dbManager.updateUserState(userId, email);
     if (!dbExists) {
-      dbManager.updateUserState(userId, email, null);
       notifyInfo("[client] created user database: " + perUserDbPath);
     } else {
-      String currentSync = dbManager.getLastSyncSequenceId(userId);
-      dbManager.updateUserState(userId, email, currentSync);
       notifyInfo("[client] connected to user database: " + perUserDbPath);
     }
   }
@@ -197,7 +288,8 @@ public class ChatClientSession {
   private String resolveUserDbPath(String email) {
     String normalizedEmail = email.trim().toLowerCase();
     String safeName = normalizedEmail.replaceAll("[^a-z0-9@._-]", "_");
-    return Path.of("chat-client", "db", safeName + ".db").toString();
+    String prefix = isProd ? "prod_" : "dev_";
+    return Path.of("chat-client", "db", prefix + safeName + ".db").toString();
   }
 
   /**
@@ -265,7 +357,11 @@ public class ChatClientSession {
     heartbeatManager.stop();
 
     isConnected.set(false);
-    isAuthenticated.set(false);
+    if (isClosing.get()) {
+      isAuthenticated.set(false);
+      currentUserId = null;
+      currentEmail = null;
+    }
 
     CountDownLatch latch = authLatchRef.getAndSet(null);
     if (latch != null) {
@@ -276,7 +372,7 @@ public class ChatClientSession {
 
     if (requestObserver != null) {
       try {
-        requestObserver.onCompleted();
+      requestObserver.onCompleted();
       } catch (Exception ignored) {
       }
       requestObserver = null;
@@ -443,6 +539,78 @@ public class ChatClientSession {
   }
 
   /**
+   * Responsibility: expose older local messages before one sequence cursor.
+   * Input: conversation id, before-sequence cursor, and max rows.
+   * Output: chronological older messages from local SQLite.
+   */
+  public List<DatabaseManager.MessageRow> listMessagesBeforeSequence(
+      String conversationId, long beforeSequenceId, int limit) {
+    DatabaseManager localDb = dbManager;
+    if (localDb == null || conversationId == null || conversationId.isBlank()) {
+      return Collections.emptyList();
+    }
+    return localDb.listMessagesBeforeSequence(conversationId, beforeSequenceId, limit);
+  }
+
+  /**
+   * Responsibility: expose local sequence-id existence set for one inclusive range.
+   * Input: conversation id and sequence range.
+   * Output: set of sequence ids currently present in sqlite.
+   */
+  public Set<Long> listExistingSequenceIdsInRange(
+      String conversationId, long startSequenceId, long endSequenceId) {
+    DatabaseManager localDb = dbManager;
+    if (localDb == null || conversationId == null || conversationId.isBlank()) {
+      return Set.of();
+    }
+    return localDb.listExistingSequenceIdsInRange(conversationId, startSequenceId, endSequenceId);
+  }
+
+  /**
+   * Responsibility: expose local messages in one inclusive sequence range.
+   * Input: conversation id and sequence range.
+   * Output: messages ordered by sequence asc.
+   */
+  public List<DatabaseManager.MessageRow> listMessagesBySequenceRange(
+      String conversationId, long startSequenceId, long endSequenceId) {
+    DatabaseManager localDb = dbManager;
+    if (localDb == null || conversationId == null || conversationId.isBlank()) {
+      return Collections.emptyList();
+    }
+    return localDb.listMessagesBySequenceRange(conversationId, startSequenceId, endSequenceId);
+  }
+
+  /**
+   * Responsibility: expose current per-conversation latest sequence id for debug UI.
+   * Input: conversation id.
+   * Output: local cursor value or 0 when unavailable.
+   */
+  public long getLatestMessageSequenceId(String conversationId) {
+    DatabaseManager localDb = dbManager;
+    if (localDb == null
+        || currentUserId == null
+        || currentUserId.isBlank()
+        || conversationId == null
+        || conversationId.isBlank()) {
+      return 0L;
+    }
+    return localDb.getConversationCursor(currentUserId, conversationId);
+  }
+
+  /**
+   * Responsibility: expose max stored sequence id in local messages table for one conversation.
+   * Input: conversation id.
+   * Output: max locally persisted sequence id or 0.
+   */
+  public long getMaxStoredSequenceId(String conversationId) {
+    DatabaseManager localDb = dbManager;
+    if (localDb == null || conversationId == null || conversationId.isBlank()) {
+      return 0L;
+    }
+    return localDb.getMaxStoredSequenceId(conversationId);
+  }
+
+  /**
    * Responsibility: return current auth state.
    * Input: none.
    * Output: true when authenticated.
@@ -536,5 +704,17 @@ public class ChatClientSession {
    */
   private String safe(String value) {
     return value == null ? "" : value;
+  }
+
+  /**
+   * Responsibility: normalize configurable page size into positive bounded value.
+   * Input: candidate limit, default value, and max bound.
+   * Output: sanitized limit safe for server requests.
+   */
+  private int normalizePositiveLimit(int candidate, int defaultValue, int maxValue) {
+    if (candidate <= 0) {
+      return defaultValue;
+    }
+    return Math.min(candidate, maxValue);
   }
 }
