@@ -6,6 +6,8 @@ import com.azure.cosmos.CosmosContainer;
 import com.azure.cosmos.CosmosDatabase;
 import com.azure.cosmos.CosmosException;
 import com.azure.cosmos.models.CosmosItemResponse;
+import com.azure.cosmos.models.CosmosPatchItemRequestOptions;
+import com.azure.cosmos.models.CosmosPatchOperations;
 import com.azure.cosmos.models.CosmosQueryRequestOptions;
 import com.azure.cosmos.models.PartitionKey;
 import com.azure.cosmos.models.SqlParameter;
@@ -552,6 +554,39 @@ public class CosmosDBHandler {
    * Input: conversation id and persisted message timestamp.
    * Output: true when update succeeds; false otherwise.
    */
+  public TouchResult touchConversationFast(String conversationId, long lastMessageAtMs) {
+    if (conversationsContainer == null) {
+      logger.error("Conversations container not initialized");
+      return new TouchResult(false, 0, "conversations container not initialized");
+    }
+
+    String normalizedConversationId = conversationId == null ? "" : conversationId.trim();
+    if (normalizedConversationId.isBlank()) {
+      return new TouchResult(false, 0, "conversationId is required");
+    }
+
+    try {
+      CosmosPatchOperations patchOperations = CosmosPatchOperations.create()
+          .set("/updatedAtMs", lastMessageAtMs)
+          .set("/lastMessageAtMs", lastMessageAtMs);
+      conversationsContainer.patchItem(
+          normalizedConversationId,
+          new PartitionKey(normalizedConversationId),
+          patchOperations,
+          new CosmosPatchItemRequestOptions(),
+          Map.class);
+      return new TouchResult(true, 200, null);
+    } catch (CosmosException e) {
+      logger.warn(
+          "touchConversationFast failed conversationId={} statusCode={}",
+          normalizedConversationId,
+          e.getStatusCode());
+      return new TouchResult(false, e.getStatusCode(), e.getMessage());
+    } catch (Exception e) {
+      logger.error("touchConversationFast failed conversationId={}", normalizedConversationId, e);
+      return new TouchResult(false, 0, e.getMessage());
+    }
+  }
 
   // TODO: is lastMessageAtMs in "conversation" needed?
   public boolean touchConversation(String conversationId, long lastMessageAtMs) {
@@ -721,6 +756,9 @@ public class CosmosDBHandler {
       String status,
       long createdAtMs,
       long updatedAtMs) {
+  }
+
+  public record TouchResult(boolean success, int statusCode, String errorReason) {
   }
 
   public enum PersistStatus {

@@ -60,6 +60,7 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
   private final ConnectionRegistry connectionRegistry;
   private final CosmosDBHandler cosmosDBHandler;
   private final RedisHandler redisHandler;
+  private final PostPersistWorker postPersistWorker;
   private final PasswordEncoder passwordEncoder;
 
   @org.springframework.beans.factory.annotation.Value("${container.app.replica.name}")
@@ -73,10 +74,12 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
   public MessagingServiceImpl(
       ConnectionRegistry registry,
       CosmosDBHandler cosmosDBHandler,
-      RedisHandler redisHandler) {
+      RedisHandler redisHandler,
+      PostPersistWorker postPersistWorker) {
     this.connectionRegistry = registry;
     this.cosmosDBHandler = cosmosDBHandler;
     this.redisHandler = redisHandler;
+    this.postPersistWorker = postPersistWorker;
     this.passwordEncoder = new BCryptPasswordEncoder();
   }
 
@@ -330,8 +333,6 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
           return;
         }
 
-        cosmosDBHandler.touchConversation(conversation.conversationId(), persistedMessage.sentAtMs());
-
         sendMessageAck(
             SendMessageAck.newBuilder()
                 .setClientMsgId(clientMsgId)
@@ -342,19 +343,24 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
                 .setSequenceId(persistedMessage.sequenceId())
                 .build());
 
+        String senderEmailSnapshot = effectiveEmail == null ? "" : effectiveEmail;
         InboundMessage inboundMessage = InboundMessage.newBuilder()
             .setServerMsgId(persistedMessage.serverMsgId())
             .setClientMsgId(persistedMessage.clientMsgId())
             .setConversationId(persistedMessage.conversationId())
             .setFromUserId(persistedMessage.senderUserId())
-            .setFromEmail(effectiveEmail == null ? "" : effectiveEmail)
+            .setFromEmail(senderEmailSnapshot)
             .setToUserId(persistedMessage.recipientUserId())
             .setText(persistedMessage.text())
             .setSentAtMs(persistedMessage.sentAtMs())
             .setSequenceId(persistedMessage.sequenceId())
             .build();
-
-        deliverLiveMessage(recipientUserId, toEmail, inboundMessage);
+        postPersistWorker.submit(
+            conversation.conversationId(),
+            persistedMessage.sentAtMs(),
+            recipientUserId,
+            toEmail,
+            inboundMessage);
       }
 
       /**
@@ -663,58 +669,6 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
       private String deriveServerMsgId(String senderUserId, String clientMsgId) {
         String dedupeKey = senderUserId + "::" + clientMsgId;
         return UUID.nameUUIDFromBytes(dedupeKey.getBytes(StandardCharsets.UTF_8)).toString();
-      }
-
-      /**
-       * Responsibility: route live message to local or remote recipient session when
-       * online.
-       * Input: recipient id/email and canonical inbound payload.
-       * Output: best-effort delivery side-effect (no sender ack downgrade on
-       * failure).
-       */
-      private void deliverLiveMessage(String toUserId, String toEmail, InboundMessage message) {
-        UserSession localUserSession = connectionRegistry.getSession(toUserId);
-        if (localUserSession != null) {
-          localUserSession.send(ServerEvent.newBuilder().setInboundMessage(message).build());
-          logger.info(
-              "[{}] live-delivered local sender={} recipient={} serverMsgId={} conversationId={} sequenceId={}",
-              serverReplicaId,
-              message.getFromUserId(),
-              toUserId,
-              message.getServerMsgId(),
-              message.getConversationId(),
-              message.getSequenceId());
-          return;
-        }
-
-        String routingInfo = connectionRegistry.getRoutingInfo(toUserId);
-        if (routingInfo != null) {
-          String[] parts = routingInfo.split(":", 2);
-          if (parts.length == 2) {
-            String targetInstanceId = parts[0];
-            String targetSessionId = parts[1];
-            connectionRegistry.ReplayMessageToNode(targetInstanceId, toUserId, targetSessionId, message);
-            logger.info(
-                "[{}] live-relayed sender={} recipientEmail={} targetInstance={} serverMsgId={} conversationId={} sequenceId={}",
-                serverReplicaId,
-                message.getFromUserId(),
-                toEmail,
-                targetInstanceId,
-                message.getServerMsgId(),
-                message.getConversationId(),
-                message.getSequenceId());
-            return;
-          }
-        }
-
-        logger.info(
-            "[{}] recipient offline sender={} recipient={} serverMsgId={} conversationId={} sequenceId={}",
-            serverReplicaId,
-            message.getFromUserId(),
-            toUserId,
-            message.getServerMsgId(),
-            message.getConversationId(),
-            message.getSequenceId());
       }
 
       /**

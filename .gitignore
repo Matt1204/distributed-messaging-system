@@ -17,7 +17,7 @@
 **/.env
 
 /docs
-
+/results
 ## OS files
 .DS_Store
 *.db
