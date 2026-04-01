@@ -231,12 +231,28 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
       }
 
       notifySendAck(ack.getClientMsgId(), true, "", "");
+      notifySendAckDetailed(
+          ack.getClientMsgId(),
+          ack.getServerMsgId(),
+          ack.getConversationId(),
+          ack.getSequenceId(),
+          true,
+          "",
+          "");
       notifyConversationRefresh();
       return;
     }
 
     dbManager.deleteOutboundByClientMsgId(ack.getClientMsgId());
     notifySendAck(ack.getClientMsgId(), false, ack.getErrorCode(), ack.getErrorReason());
+    notifySendAckDetailed(
+        ack.getClientMsgId(),
+        ack.getServerMsgId(),
+        ack.getConversationId(),
+        ack.getSequenceId(),
+        false,
+        ack.getErrorCode(),
+        ack.getErrorReason());
     notifyConversationRefresh();
   }
 
@@ -386,6 +402,21 @@ public class ServerResponseHandler implements StreamObserver<ServerEvent> {
     ClientUiListener listener = uiListenerSupplier.get();
     if (listener != null) {
       listener.onSendAck(clientMsgId, success, code, reason);
+    }
+  }
+
+  private void notifySendAckDetailed(
+      String clientMsgId,
+      String serverMsgId,
+      String conversationId,
+      long sequenceId,
+      boolean success,
+      String code,
+      String reason) {
+    ClientUiListener listener = uiListenerSupplier.get();
+    if (listener != null) {
+      listener.onSendAckDetailed(
+          clientMsgId, serverMsgId, conversationId, sequenceId, success, code, reason);
     }
   }
 

@@ -389,24 +389,60 @@ public class ChatClientSession {
    * Output: outbound grpc event plus provisional SQLite row.
    */
   public void sendMessage(String toEmail, String text, String conversationId, String peerUserId) {
+    sendMessageAndReturnClientMsgId(toEmail, text, conversationId, peerUserId);
+  }
+
+  /**
+   * Responsibility: send one outbound message and return generated clientMsgId for correlation.
+   * Input: recipient email, text, and optional existing conversation/peer user id.
+   * Output: generated clientMsgId, even when send later fails.
+   */
+  public String sendMessageAndReturnClientMsgId(
+      String toEmail, String text, String conversationId, String peerUserId) {
+    String clientMsgId = UUID.randomUUID().toString();
+    sendMessageWithClientMsgId(toEmail, text, conversationId, peerUserId, clientMsgId);
+    return clientMsgId;
+  }
+
+  /**
+   * Responsibility: send one outbound message using caller-provided clientMsgId.
+   * Input: outbound fields plus stable clientMsgId.
+   * Output: true when event is emitted to grpc stream.
+   */
+  public boolean sendMessageWithClientMsgId(
+      String toEmail, String text, String conversationId, String peerUserId, String clientMsgId) {
+    String normalizedClientMsgId = clientMsgId == null ? "" : clientMsgId.trim();
+    if (normalizedClientMsgId.isBlank()) {
+      notifyInfo("[client] sendMessage requires non-empty clientMsgId.");
+      return false;
+    }
+    return sendMessageInternal(
+        toEmail, text, conversationId, peerUserId, normalizedClientMsgId);
+  }
+
+  private boolean sendMessageInternal(
+      String toEmail,
+      String text,
+      String conversationId,
+      String peerUserId,
+      String clientMsgId) {
     if (!isAuthenticated.get()) {
       notifyInfo("[client] Not authenticated. Please login/register first.");
-      return;
+      return false;
     }
     if (requestObserver == null) {
       notifyInfo("[client] Not connected. Queuing not implemented.");
-      return;
+      return false;
     }
 
     String normalizedToEmail = toEmail == null ? "" : toEmail.trim().toLowerCase();
     String trimmedText = text == null ? "" : text.trim();
     String normalizedConversationId = conversationId == null ? "" : conversationId.trim();
     String normalizedPeerUserId = peerUserId == null ? "" : peerUserId.trim();
-    String clientMsgId = UUID.randomUUID().toString();
 
     if (normalizedToEmail.isBlank() || trimmedText.isBlank()) {
       notifyInfo("[client] sendMessage requires toEmail and non-empty text.");
-      return;
+      return false;
     }
 
     DatabaseManager localDb = this.dbManager;
@@ -434,6 +470,7 @@ public class ChatClientSession {
 
     try {
       requestObserver.onNext(ClientEvent.newBuilder().setOutboundMessage(outboundMessage).build());
+      return true;
     } catch (Exception e) {
       notifyInfo("[client] Failed to send message: " + e.getMessage());
       if (localDb != null) {
@@ -441,6 +478,7 @@ public class ChatClientSession {
         notifyConversationDataChanged();
       }
       triggerReconnect();
+      return false;
     }
   }
 
@@ -617,6 +655,28 @@ public class ChatClientSession {
    */
   public boolean isAuthenticated() {
     return isAuthenticated.get();
+  }
+
+  /**
+   * Responsibility: block caller until transport is connected or timeout.
+   * Input: timeout milliseconds.
+   * Output: true when connected before timeout.
+   */
+  public boolean awaitConnected(long timeoutMs) {
+    long boundedTimeout = Math.max(0L, timeoutMs);
+    long deadline = System.currentTimeMillis() + boundedTimeout;
+    while (System.currentTimeMillis() < deadline) {
+      if (isConnected.get()) {
+        return true;
+      }
+      try {
+        Thread.sleep(50L);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        break;
+      }
+    }
+    return isConnected.get();
   }
 
   /**

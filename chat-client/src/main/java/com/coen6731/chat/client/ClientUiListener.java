@@ -16,6 +16,20 @@ public interface ClientUiListener {
 
   void onSendAck(String clientMsgId, boolean success, String code, String reason);
 
+  /**
+   * Responsibility: provide extended send-ack metadata for headless performance tooling.
+   * Input: outbound correlation ids plus ack result.
+   * Output: optional consumer-side metrics collection side-effect.
+   */
+  default void onSendAckDetailed(
+      String clientMsgId,
+      String serverMsgId,
+      String conversationId,
+      long sequenceId,
+      boolean success,
+      String code,
+      String reason) {}
+
   void onConversationDataChanged();
 
   void onHistoryResultSummary(String conversationId, long startSequenceId, int messageCount);
