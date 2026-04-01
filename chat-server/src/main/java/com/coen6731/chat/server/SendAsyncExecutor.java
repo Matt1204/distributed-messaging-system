@@ -21,7 +21,6 @@ import org.springframework.stereotype.Component;
 @Component
 public class SendAsyncExecutor {
   private static final Logger logger = LoggerFactory.getLogger(SendAsyncExecutor.class);
-  private static final int WORKER_THREADS = 6;
   private static final int QUEUE_CAPACITY = 30000;
   private static final int SHUTDOWN_WAIT_SECONDS = 8;
   private static final long REJECT_LOG_INTERVAL_MS = 10000L;
@@ -33,11 +32,14 @@ public class SendAsyncExecutor {
   private final LongAdder completedCount = new LongAdder();
   private final AtomicLong lastRejectLogAtMs = new AtomicLong(0L);
 
-  public SendAsyncExecutor(@Value("${container.app.replica.name}") String serverReplicaId) {
+  public SendAsyncExecutor(
+      @Value("${container.app.replica.name}") String serverReplicaId,
+      @Value("${chat.send.worker-threads}") int configuredWorkerThreads) {
     this.serverReplicaId = serverReplicaId;
+    int workerThreads = Math.max(1, configuredWorkerThreads);
     this.executor = new ThreadPoolExecutor(
-        WORKER_THREADS,
-        WORKER_THREADS,
+        workerThreads,
+        workerThreads,
         0L,
         TimeUnit.MILLISECONDS,
         new ArrayBlockingQueue<>(QUEUE_CAPACITY),
@@ -47,6 +49,11 @@ public class SendAsyncExecutor {
           worker.setDaemon(true);
           return worker;
         });
+    logger.info(
+        "[{}] send executor initialized workerThreads={} queueCapacity={}",
+        serverReplicaId,
+        workerThreads,
+        QUEUE_CAPACITY);
   }
 
   private static final AtomicInteger THREAD_COUNTER = new AtomicInteger(1);
@@ -85,6 +92,21 @@ public class SendAsyncExecutor {
     }
   }
 
+  /**
+   * Responsibility: provide a point-in-time executor state snapshot for diagnostics.
+   * Input: none.
+   * Output: immutable metrics snapshot.
+   */
+  public ExecutorSnapshot snapshot() {
+    return new ExecutorSnapshot(
+        executor.getCorePoolSize(),
+        executor.getActiveCount(),
+        executor.getQueue().size(),
+        submittedCount.sum(),
+        completedCount.sum(),
+        rejectedCount.sum());
+  }
+
   @PreDestroy
   public void shutdown() {
     executor.shutdown();
@@ -120,5 +142,14 @@ public class SendAsyncExecutor {
           Math.max(0L, nowMs - acceptedAtMs),
           rejectedCount.sum());
     }
+  }
+
+  public record ExecutorSnapshot(
+      int workerThreads,
+      int activeWorkers,
+      int queueDepth,
+      long submitted,
+      long completed,
+      long rejected) {
   }
 }

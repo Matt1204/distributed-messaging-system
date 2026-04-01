@@ -330,6 +330,10 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
           long acceptedAtMs) {
         long workerStartedAtMs = System.currentTimeMillis();
         String outcome = "FAILED";
+        String resolvedConversationId = safeTrim(requestedConversationId);
+        String resolvedRecipientUserId = "";
+        String resolvedServerMsgId = "";
+        long resolvedSequenceId = 0L;
         try {
           Optional<CosmosDBHandler.UserRecord> recipientUserRec = cosmosDBHandler.findUserByEmail(toEmail);
           if (recipientUserRec.isEmpty()) {
@@ -340,6 +344,7 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
             return;
           }
           String recipientUserId = recipientUserRec.get().userId();
+          resolvedRecipientUserId = recipientUserId;
 
           Optional<CosmosDBHandler.ConversationRecord> conversationOpt = resolveConversationId(
               requestedConversationId,
@@ -359,8 +364,10 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
             return;
           }
           CosmosDBHandler.ConversationRecord conversation = conversationOpt.get();
+          resolvedConversationId = conversation.conversationId();
 
           long sequenceId = allocateNextSequenceId(conversation.conversationId());
+          resolvedSequenceId = sequenceId;
           if (sequenceId <= 0) {
             sendMessageAckToSender(
                 senderUserId,
@@ -376,6 +383,7 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
           }
 
           String serverMsgId = deriveServerMsgId(senderUserId, clientMsgId);
+          resolvedServerMsgId = serverMsgId;
           CosmosDBHandler.MessageRecord persistedMessage = persistMessage(
               senderSession,
               senderUserId,
@@ -428,35 +436,26 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
           long queueWaitMs = Math.max(0L, workerStartedAtMs - acceptedAtMs);
           long workerExecMs = Math.max(0L, finishedAtMs - workerStartedAtMs);
           long totalMs = Math.max(0L, finishedAtMs - acceptedAtMs);
-
-          if (totalMs >= 1000 || queueWaitMs >= 500) {
-            logger.warn(
-                "[{}] send_latency outcome={} clientMsgId={} queueWaitMs={} workerExecMs={} totalMs={}",
-                serverReplicaId,
-                outcome,
-                clientMsgId,
-                queueWaitMs,
-                workerExecMs,
-                totalMs);
-          } else if (totalMs >= 300) {
-            logger.info(
-                "[{}] send_latency outcome={} clientMsgId={} queueWaitMs={} workerExecMs={} totalMs={}",
-                serverReplicaId,
-                outcome,
-                clientMsgId,
-                queueWaitMs,
-                workerExecMs,
-                totalMs);
-          } else {
-            logger.debug(
-                "[{}] send_latency outcome={} clientMsgId={} queueWaitMs={} workerExecMs={} totalMs={}",
-                serverReplicaId,
-                outcome,
-                clientMsgId,
-                queueWaitMs,
-                workerExecMs,
-                totalMs);
-          }
+          SendAsyncExecutor.ExecutorSnapshot executorSnapshot = sendAsyncExecutor.snapshot();
+          String workerThread = Thread.currentThread().getName();
+          logger.info(
+              "[{}] send_latency outcome={} clientMsgId={} "
+                  + "sequenceId={} queueWaitMs={} workerExecMs={} totalMs={} "
+                  + "workerThread={} workerThreads={} activeWorkers={} queueDepth={} submitted={} completed={} rejected={}",
+              serverReplicaId,
+              outcome,
+              clientMsgId,
+              resolvedSequenceId,
+              queueWaitMs,
+              workerExecMs,
+              totalMs,
+              workerThread,
+              executorSnapshot.workerThreads(),
+              executorSnapshot.activeWorkers(),
+              executorSnapshot.queueDepth(),
+              executorSnapshot.submitted(),
+              executorSnapshot.completed(),
+              executorSnapshot.rejected());
         }
       }
 
