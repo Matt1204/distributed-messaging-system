@@ -53,6 +53,7 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
   private static final String ERROR_RECIPIENT_NOT_FOUND = "RECIPIENT_NOT_FOUND";
   private static final String ERROR_CONVERSATION_INVALID = "CONVERSATION_INVALID";
   private static final String ERROR_PERSISTENCE_FAILED = "PERSISTENCE_FAILED";
+  private static final String ERROR_OVERLOADED = "OVERLOADED";
   private static final int MAX_TEXT_LENGTH = 4096;
   private static final int FALLBACK_CATCHUP_LIMIT = 50;
   private static final int MAX_PAGE_LIMIT = 200;
@@ -60,7 +61,7 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
   private final ConnectionRegistry connectionRegistry;
   private final CosmosDBHandler cosmosDBHandler;
   private final RedisHandler redisHandler;
-  private final PostPersistWorker postPersistWorker;
+  private final SendAsyncExecutor sendAsyncExecutor;
   private final PasswordEncoder passwordEncoder;
 
   @org.springframework.beans.factory.annotation.Value("${container.app.replica.name}")
@@ -75,11 +76,11 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
       ConnectionRegistry registry,
       CosmosDBHandler cosmosDBHandler,
       RedisHandler redisHandler,
-      PostPersistWorker postPersistWorker) {
+      SendAsyncExecutor sendAsyncExecutor) {
     this.connectionRegistry = registry;
     this.cosmosDBHandler = cosmosDBHandler;
     this.redisHandler = redisHandler;
-    this.postPersistWorker = postPersistWorker;
+    this.sendAsyncExecutor = sendAsyncExecutor;
     this.passwordEncoder = new BCryptPasswordEncoder();
   }
 
@@ -286,81 +287,177 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
         if (!validateMessageContent(clientMsgId, toEmail, text)) {
           return;
         }
-
-        Optional<CosmosDBHandler.UserRecord> recipientUserRec = cosmosDBHandler.findUserByEmail(toEmail);
-        if (recipientUserRec.isEmpty()) {
-          sendMessageAck(
-              buildFailedAck(clientMsgId, "", "", 0L, ERROR_RECIPIENT_NOT_FOUND, "recipient email not found"));
-          return;
-        }
-        String recipientUserId = recipientUserRec.get().userId();
-
-        Optional<CosmosDBHandler.ConversationRecord> conversationOpt = resolveConversationId(
-            outboundMessage.getConversationId(), recipientUserId);
-
-        if (conversationOpt.isEmpty()) {
-          sendMessageAck(
-              buildFailedAck(
-                  clientMsgId,
-                  "",
-                  safeTrim(outboundMessage.getConversationId()),
-                  0L,
-                  ERROR_CONVERSATION_INVALID,
-                  "failed to resolve conversation"));
-          return;
-        }
-        CosmosDBHandler.ConversationRecord conversation = conversationOpt.get();
-
-        // the incremented sequenceId for new message
-        long sequenceId = allocateNextSequenceId(conversation.conversationId());
-        if (sequenceId <= 0) {
-          sendMessageAck(
-              buildFailedAck(
-                  clientMsgId,
-                  "",
-                  conversation.conversationId(),
-                  0L,
-                  ERROR_INTERNAL,
-                  "failed to allocate sequence id"));
-          return;
-        }
-
-        String serverMsgId = deriveServerMsgId(effectiveUserId, clientMsgId);
-        CosmosDBHandler.MessageRecord persistedMessage = persistMessage(clientMsgId, serverMsgId,
-            conversation.conversationId(), sequenceId, recipientUserId, text);
-
-        if (persistedMessage == null) {
-          return;
-        }
-
-        sendMessageAck(
-            SendMessageAck.newBuilder()
-                .setClientMsgId(clientMsgId)
-                .setServerMsgId(persistedMessage.serverMsgId())
-                .setConversationId(persistedMessage.conversationId())
-                .setStatus(SendStatus.PERSISTED_PENDING_DELIVERY)
-                .setAckTs(persistedMessage.sentAtMs())
-                .setSequenceId(persistedMessage.sequenceId())
-                .build());
-
+        String senderUserIdSnapshot = effectiveUserId;
         String senderEmailSnapshot = effectiveEmail == null ? "" : effectiveEmail;
-        InboundMessage inboundMessage = InboundMessage.newBuilder()
-            .setServerMsgId(persistedMessage.serverMsgId())
-            .setClientMsgId(persistedMessage.clientMsgId())
-            .setConversationId(persistedMessage.conversationId())
-            .setFromUserId(persistedMessage.senderUserId())
-            .setFromEmail(senderEmailSnapshot)
-            .setToUserId(persistedMessage.recipientUserId())
-            .setText(persistedMessage.text())
-            .setSentAtMs(persistedMessage.sentAtMs())
-            .setSequenceId(persistedMessage.sequenceId())
-            .build();
-        postPersistWorker.submit(
-            conversation.conversationId(),
-            persistedMessage.sentAtMs(),
-            recipientUserId,
-            toEmail,
-            inboundMessage);
+        String requestedConversationId = safeTrim(outboundMessage.getConversationId());
+        UserSession senderSessionSnapshot = session;
+        long acceptedAtMs = System.currentTimeMillis();
+
+        boolean accepted = sendAsyncExecutor.submit(
+            senderUserIdSnapshot,
+            clientMsgId,
+            acceptedAtMs,
+            () -> processSendMessageAsync(
+                senderSessionSnapshot,
+                senderUserIdSnapshot,
+                senderEmailSnapshot,
+                requestedConversationId,
+                clientMsgId,
+                toEmail,
+                text,
+                acceptedAtMs));
+        if (!accepted) {
+          sendMessageAckToSender(
+              senderUserIdSnapshot,
+              senderSessionSnapshot,
+              buildFailedAck(clientMsgId, "", requestedConversationId, 0L, ERROR_OVERLOADED, "send queue is full"));
+        }
+      }
+
+      /**
+       * Responsibility: message processing workflow to be executed asynchronously.
+       * Input: sender session, sender user id, sender email, requested conversation id, client message id, to email, text, accepted at milliseconds.
+       * Output: none.
+       */
+      private void processSendMessageAsync(
+          UserSession senderSession,
+          String senderUserId,
+          String senderEmail,
+          String requestedConversationId,
+          String clientMsgId,
+          String toEmail,
+          String text,
+          long acceptedAtMs) {
+        long workerStartedAtMs = System.currentTimeMillis();
+        String outcome = "FAILED";
+        try {
+          Optional<CosmosDBHandler.UserRecord> recipientUserRec = cosmosDBHandler.findUserByEmail(toEmail);
+          if (recipientUserRec.isEmpty()) {
+            sendMessageAckToSender(
+                senderUserId,
+                senderSession,
+                buildFailedAck(clientMsgId, "", "", 0L, ERROR_RECIPIENT_NOT_FOUND, "recipient email not found"));
+            return;
+          }
+          String recipientUserId = recipientUserRec.get().userId();
+
+          Optional<CosmosDBHandler.ConversationRecord> conversationOpt = resolveConversationId(
+              requestedConversationId,
+              senderUserId,
+              recipientUserId);
+          if (conversationOpt.isEmpty()) {
+            sendMessageAckToSender(
+                senderUserId,
+                senderSession,
+                buildFailedAck(
+                    clientMsgId,
+                    "",
+                    requestedConversationId,
+                    0L,
+                    ERROR_CONVERSATION_INVALID,
+                    "failed to resolve conversation"));
+            return;
+          }
+          CosmosDBHandler.ConversationRecord conversation = conversationOpt.get();
+
+          long sequenceId = allocateNextSequenceId(conversation.conversationId());
+          if (sequenceId <= 0) {
+            sendMessageAckToSender(
+                senderUserId,
+                senderSession,
+                buildFailedAck(
+                    clientMsgId,
+                    "",
+                    conversation.conversationId(),
+                    0L,
+                    ERROR_INTERNAL,
+                    "failed to allocate sequence id"));
+            return;
+          }
+
+          String serverMsgId = deriveServerMsgId(senderUserId, clientMsgId);
+          CosmosDBHandler.MessageRecord persistedMessage = persistMessage(
+              senderSession,
+              senderUserId,
+              clientMsgId,
+              serverMsgId,
+              conversation.conversationId(),
+              sequenceId,
+              recipientUserId,
+              text);
+          if (persistedMessage == null) {
+            return;
+          }
+
+          safeTouchConversation(conversation.conversationId(), persistedMessage.sentAtMs());
+
+          sendMessageAckToSender(
+              senderUserId,
+              senderSession,
+              SendMessageAck.newBuilder()
+                  .setClientMsgId(clientMsgId)
+                  .setServerMsgId(persistedMessage.serverMsgId())
+                  .setConversationId(persistedMessage.conversationId())
+                  .setStatus(SendStatus.PERSISTED_PENDING_DELIVERY)
+                  .setAckTs(persistedMessage.sentAtMs())
+                  .setSequenceId(persistedMessage.sequenceId())
+                  .build());
+
+          InboundMessage inboundMessage = InboundMessage.newBuilder()
+              .setServerMsgId(persistedMessage.serverMsgId())
+              .setClientMsgId(persistedMessage.clientMsgId())
+              .setConversationId(persistedMessage.conversationId())
+              .setFromUserId(persistedMessage.senderUserId())
+              .setFromEmail(senderEmail)
+              .setToUserId(persistedMessage.recipientUserId())
+              .setText(persistedMessage.text())
+              .setSentAtMs(persistedMessage.sentAtMs())
+              .setSequenceId(persistedMessage.sequenceId())
+              .build();
+
+          deliverLiveMessage(recipientUserId, inboundMessage);
+          outcome = "PERSISTED";
+        } catch (Exception e) {
+          logger.warn("[{}] send pipeline exception sender={} clientMsgId={}", serverReplicaId, senderUserId, clientMsgId, e);
+          sendMessageAckToSender(
+              senderUserId,
+              senderSession,
+              buildFailedAck(clientMsgId, "", requestedConversationId, 0L, ERROR_INTERNAL, "send pipeline error"));
+        } finally {
+          long finishedAtMs = System.currentTimeMillis();
+          long queueWaitMs = Math.max(0L, workerStartedAtMs - acceptedAtMs);
+          long workerExecMs = Math.max(0L, finishedAtMs - workerStartedAtMs);
+          long totalMs = Math.max(0L, finishedAtMs - acceptedAtMs);
+
+          if (totalMs >= 1000 || queueWaitMs >= 500) {
+            logger.warn(
+                "[{}] send_latency outcome={} clientMsgId={} queueWaitMs={} workerExecMs={} totalMs={}",
+                serverReplicaId,
+                outcome,
+                clientMsgId,
+                queueWaitMs,
+                workerExecMs,
+                totalMs);
+          } else if (totalMs >= 300) {
+            logger.info(
+                "[{}] send_latency outcome={} clientMsgId={} queueWaitMs={} workerExecMs={} totalMs={}",
+                serverReplicaId,
+                outcome,
+                clientMsgId,
+                queueWaitMs,
+                workerExecMs,
+                totalMs);
+          } else {
+            logger.debug(
+                "[{}] send_latency outcome={} clientMsgId={} queueWaitMs={} workerExecMs={} totalMs={}",
+                serverReplicaId,
+                outcome,
+                clientMsgId,
+                queueWaitMs,
+                workerExecMs,
+                totalMs);
+          }
+        }
       }
 
       /**
@@ -537,6 +634,8 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
        * Output: persisted message record, or null after failed ack.
        */
       private CosmosDBHandler.MessageRecord persistMessage(
+          UserSession senderSession,
+          String senderUserId,
           String clientMsgId,
           String serverMsgId,
           String conversationId,
@@ -550,7 +649,7 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
             clientMsgId,
             conversationId,
             sequenceId,
-            effectiveUserId,
+            senderUserId,
             recipientUserId,
             text,
             nowMs,
@@ -564,7 +663,9 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
         } else if (persistResult.status() == CosmosDBHandler.PersistStatus.ALREADY_EXISTS) {
           Optional<CosmosDBHandler.MessageRecord> existing = cosmosDBHandler.findMessageByServerMsgId(serverMsgId);
           if (existing.isEmpty()) {
-            sendMessageAck(
+            sendMessageAckToSender(
+                senderUserId,
+                senderSession,
                 buildFailedAck(
                     clientMsgId,
                     serverMsgId,
@@ -576,7 +677,9 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
           }
           return existing.get();
         } else {
-          sendMessageAck(
+          sendMessageAckToSender(
+              senderUserId,
+              senderSession,
               buildFailedAck(
                   clientMsgId,
                   serverMsgId,
@@ -596,11 +699,12 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
        */
       private Optional<CosmosDBHandler.ConversationRecord> resolveConversationId(
           String requestedConversationId,
+          String senderUserId,
           String recipientUserId) {
         String normalizedReqConversationId = safeTrim(requestedConversationId);
         return cosmosDBHandler.createConversationIfAbsent(
             normalizedReqConversationId,
-            effectiveUserId,
+            senderUserId,
             recipientUserId,
             Instant.now().toEpochMilli());
       }
@@ -671,6 +775,48 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
         return UUID.nameUUIDFromBytes(dedupeKey.getBytes(StandardCharsets.UTF_8)).toString();
       }
 
+      private void safeTouchConversation(String conversationId, long lastMessageAtMs) {
+        CosmosDBHandler.TouchResult touchResult = cosmosDBHandler.touchConversationFast(conversationId, lastMessageAtMs);
+        if (touchResult.success()) {
+          return;
+        }
+        if (touchResult.statusCode() == 404 && cosmosDBHandler.touchConversation(conversationId, lastMessageAtMs)) {
+          return;
+        }
+        logger.debug(
+            "[{}] touch conversation skipped conversationId={} statusCode={}",
+            serverReplicaId,
+            conversationId,
+            touchResult.statusCode());
+      }
+
+      private void deliverLiveMessage(String toUserId, InboundMessage message) {
+        try {
+          UserSession localUserSession = connectionRegistry.getSession(toUserId);
+          if (localUserSession != null) {
+            localUserSession.send(ServerEvent.newBuilder().setInboundMessage(message).build());
+            return;
+          }
+
+          String routingInfo = connectionRegistry.getRoutingInfo(toUserId);
+          if (routingInfo != null) {
+            String[] parts = routingInfo.split(":", 2);
+            if (parts.length == 2) {
+              String targetInstanceId = parts[0];
+              String targetSessionId = parts[1];
+              connectionRegistry.ReplayMessageToNode(targetInstanceId, toUserId, targetSessionId, message);
+            }
+          }
+        } catch (Exception e) {
+          logger.debug(
+              "[{}] live delivery skipped recipient={} serverMsgId={}",
+              serverReplicaId,
+              toUserId,
+              message.getServerMsgId(),
+              e);
+        }
+      }
+
       /**
        * Responsibility: handle heartbeat ping and keep session/redis ttl alive.
        * Input: heartbeat ping event.
@@ -707,6 +853,12 @@ public class MessagingServiceImpl extends MessagingServiceGrpc.MessagingServiceI
        */
       private void sendMessageAck(SendMessageAck ack) {
         session.send(ServerEvent.newBuilder().setSendMessageAck(ack).build());
+      }
+
+      private void sendMessageAckToSender(String senderUserId, UserSession fallbackSession, SendMessageAck ack) {
+        UserSession activeSession = senderUserId == null ? null : connectionRegistry.getSession(senderUserId);
+        UserSession resolvedSession = activeSession != null ? activeSession : (fallbackSession == null ? session : fallbackSession);
+        resolvedSession.send(ServerEvent.newBuilder().setSendMessageAck(ack).build());
       }
 
       /**
