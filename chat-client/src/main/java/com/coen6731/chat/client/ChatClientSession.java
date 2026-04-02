@@ -35,6 +35,10 @@ import java.util.concurrent.atomic.AtomicReference;
  * Output: grpc requests, DB updates, and UI listener notifications.
  */
 public class ChatClientSession {
+  private static final long CHANNEL_SHUTDOWN_GRACE_MS = 3000L;
+  private static final long CHANNEL_SHUTDOWN_FORCE_MS = 2000L;
+  private static final long SCHEDULER_SHUTDOWN_WAIT_MS = 2000L;
+
   private final String target;
   private final boolean isProd;
   private volatile DatabaseManager dbManager;
@@ -378,7 +382,7 @@ public class ChatClientSession {
       requestObserver = null;
     }
     if (channel != null) {
-      channel.shutdownNow();
+      shutdownChannel(channel);
       channel = null;
     }
   }
@@ -707,6 +711,27 @@ public class ChatClientSession {
     isClosing.set(true);
     teardown();
     scheduler.shutdownNow();
+    try {
+      scheduler.awaitTermination(SCHEDULER_SHUTDOWN_WAIT_MS, TimeUnit.MILLISECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+  }
+
+  private void shutdownChannel(ManagedChannel targetChannel) {
+    try {
+      targetChannel.shutdown();
+      boolean terminated = targetChannel.awaitTermination(CHANNEL_SHUTDOWN_GRACE_MS, TimeUnit.MILLISECONDS);
+      if (!terminated) {
+        targetChannel.shutdownNow();
+        targetChannel.awaitTermination(CHANNEL_SHUTDOWN_FORCE_MS, TimeUnit.MILLISECONDS);
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      targetChannel.shutdownNow();
+    } catch (Exception ignored) {
+      targetChannel.shutdownNow();
+    }
   }
 
   /**

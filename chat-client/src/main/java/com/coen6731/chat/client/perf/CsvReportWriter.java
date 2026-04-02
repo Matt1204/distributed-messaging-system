@@ -66,10 +66,13 @@ public final class CsvReportWriter {
             StandardOpenOption.APPEND)) {
       if (!exists) {
         writer.write(
-            "run_id,scenario_id,namespace,target,is_prod,pairs,rate_per_sender,warmup_sec,measure_sec,"
+            "run_id,scenario_id,namespace,target,is_prod,pairs,arrival_pattern,rate_per_sender,warmup_sec,measure_sec,"
                 + "drain_sec,cooldown_sec,payload_bytes,ack_timeout_ms,e2e_timeout_ms,"
                 + "attempted_messages,acked_messages,received_messages,"
-                + "ack_fail_count,ack_timeout_count,e2e_timeout_count,ack_p50_ms,ack_p95_ms,ack_p99_ms,"
+                + "ack_fail_count,ack_timeout_count,e2e_timeout_count,"
+                + "attempted_rate_per_sec,ack_success_rate,receive_rate,ack_timeout_rate,e2e_timeout_rate,"
+                + "ack_latency_samples,e2e_latency_samples,"
+                + "ack_p50_ms,ack_p75_ms,ack_p85_ms,ack_p95_ms,ack_p99_ms,"
                 + "e2e_p50_ms,e2e_p95_ms,e2e_p99_ms");
         writer.newLine();
       }
@@ -81,6 +84,7 @@ public final class CsvReportWriter {
               summary.target,
               String.valueOf(summary.isProd),
               String.valueOf(summary.pairs),
+              summary.arrivalPattern,
               String.valueOf(summary.ratePerSender),
               String.valueOf(summary.warmupSec),
               String.valueOf(summary.measureSec),
@@ -95,7 +99,16 @@ public final class CsvReportWriter {
               String.valueOf(summary.ackFailCount),
               String.valueOf(summary.ackTimeoutCount),
               String.valueOf(summary.e2eTimeoutCount),
+              formatDouble(summary.attemptedRatePerSec),
+              formatDouble(summary.ackSuccessRate),
+              formatDouble(summary.receiveRate),
+              formatDouble(summary.ackTimeoutRate),
+              formatDouble(summary.e2eTimeoutRate),
+              String.valueOf(summary.ackLatencySamples),
+              String.valueOf(summary.e2eLatencySamples),
               formatDouble(summary.ackP50Ms),
+              formatDouble(summary.ackP75Ms),
+              formatDouble(summary.ackP85Ms),
               formatDouble(summary.ackP95Ms),
               formatDouble(summary.ackP99Ms),
               formatDouble(summary.e2eP50Ms),
@@ -131,6 +144,7 @@ public final class CsvReportWriter {
       String target,
       boolean isProd,
       int pairs,
+      String arrivalPattern,
       int ratePerSender,
       int warmupSec,
       int measureSec,
@@ -175,6 +189,14 @@ public final class CsvReportWriter {
       }
     }
 
+    int ackLatencySamples = ackLatencies.size();
+    int e2eLatencySamples = e2eLatencies.size();
+    double attemptedRatePerSec = safeRate(rows.size(), measureSec);
+    double ackSuccessRate = safeRate(acked, rows.size());
+    double receiveRate = safeRate(received, rows.size());
+    double ackTimeoutRate = safeRate(ackTimeout, rows.size());
+    double e2eTimeoutRate = safeRate(e2eTimeout, rows.size());
+
     return new SummaryRow(
         runId,
         scenarioId,
@@ -182,6 +204,7 @@ public final class CsvReportWriter {
         target,
         isProd,
         pairs,
+        arrivalPattern,
         ratePerSender,
         warmupSec,
         measureSec,
@@ -196,7 +219,16 @@ public final class CsvReportWriter {
         ackFail,
         ackTimeout,
         e2eTimeout,
+        attemptedRatePerSec,
+        ackSuccessRate,
+        receiveRate,
+        ackTimeoutRate,
+        e2eTimeoutRate,
+        ackLatencySamples,
+        e2eLatencySamples,
         percentile(ackLatencies, 50),
+        percentile(ackLatencies, 75),
+        percentile(ackLatencies, 85),
         percentile(ackLatencies, 95),
         percentile(ackLatencies, 99),
         percentile(e2eLatencies, 50),
@@ -241,6 +273,13 @@ public final class CsvReportWriter {
     return String.format(Locale.ROOT, "%.3f", value);
   }
 
+  private static double safeRate(int numerator, int denominator) {
+    if (denominator <= 0) {
+      return -1.0;
+    }
+    return (double) numerator / denominator;
+  }
+
   private static boolean isBlank(String value) {
     return value == null || value.isBlank();
   }
@@ -262,6 +301,9 @@ public final class CsvReportWriter {
       int payloadBytes,
       long ackTimeoutMs,
       long e2eTimeoutMs,
+      String arrivalPattern,
+      Long rngSeed,
+      int pairSetupParallelism,
       Instant start,
       Instant end,
       String gitCommit) {
@@ -271,12 +313,15 @@ public final class CsvReportWriter {
     metadata.put("target", target);
     metadata.put("is_prod", String.valueOf(isProd));
     metadata.put("pairs", String.valueOf(pairs));
+    metadata.put("arrival_pattern", arrivalPattern);
     metadata.put("rate_per_sender", String.valueOf(ratePerSender));
     metadata.put("warmup_sec", String.valueOf(warmupSec));
     metadata.put("measure_sec", String.valueOf(measureSec));
     metadata.put("payload_bytes", String.valueOf(payloadBytes));
     metadata.put("ack_timeout_ms", String.valueOf(ackTimeoutMs));
     metadata.put("e2e_timeout_ms", String.valueOf(e2eTimeoutMs));
+    metadata.put("pair_setup_parallelism", String.valueOf(pairSetupParallelism));
+    metadata.put("rng_seed", rngSeed == null ? "" : String.valueOf(rngSeed));
     metadata.put("start_time_utc", start.toString());
     metadata.put("end_time_utc", end.toString());
     metadata.put("git_commit", gitCommit == null ? "unknown" : gitCommit);
@@ -290,6 +335,7 @@ public final class CsvReportWriter {
     public final String target;
     public final boolean isProd;
     public final int pairs;
+    public final String arrivalPattern;
     public final int ratePerSender;
     public final int warmupSec;
     public final int measureSec;
@@ -304,7 +350,16 @@ public final class CsvReportWriter {
     public final int ackFailCount;
     public final int ackTimeoutCount;
     public final int e2eTimeoutCount;
+    public final double attemptedRatePerSec;
+    public final double ackSuccessRate;
+    public final double receiveRate;
+    public final double ackTimeoutRate;
+    public final double e2eTimeoutRate;
+    public final int ackLatencySamples;
+    public final int e2eLatencySamples;
     public final double ackP50Ms;
+    public final double ackP75Ms;
+    public final double ackP85Ms;
     public final double ackP95Ms;
     public final double ackP99Ms;
     public final double e2eP50Ms;
@@ -318,6 +373,7 @@ public final class CsvReportWriter {
         String target,
         boolean isProd,
         int pairs,
+        String arrivalPattern,
         int ratePerSender,
         int warmupSec,
         int measureSec,
@@ -332,7 +388,16 @@ public final class CsvReportWriter {
         int ackFailCount,
         int ackTimeoutCount,
         int e2eTimeoutCount,
+        double attemptedRatePerSec,
+        double ackSuccessRate,
+        double receiveRate,
+        double ackTimeoutRate,
+        double e2eTimeoutRate,
+        int ackLatencySamples,
+        int e2eLatencySamples,
         double ackP50Ms,
+        double ackP75Ms,
+        double ackP85Ms,
         double ackP95Ms,
         double ackP99Ms,
         double e2eP50Ms,
@@ -344,6 +409,7 @@ public final class CsvReportWriter {
       this.target = target;
       this.isProd = isProd;
       this.pairs = pairs;
+      this.arrivalPattern = arrivalPattern;
       this.ratePerSender = ratePerSender;
       this.warmupSec = warmupSec;
       this.measureSec = measureSec;
@@ -358,7 +424,16 @@ public final class CsvReportWriter {
       this.ackFailCount = ackFailCount;
       this.ackTimeoutCount = ackTimeoutCount;
       this.e2eTimeoutCount = e2eTimeoutCount;
+      this.attemptedRatePerSec = attemptedRatePerSec;
+      this.ackSuccessRate = ackSuccessRate;
+      this.receiveRate = receiveRate;
+      this.ackTimeoutRate = ackTimeoutRate;
+      this.e2eTimeoutRate = e2eTimeoutRate;
+      this.ackLatencySamples = ackLatencySamples;
+      this.e2eLatencySamples = e2eLatencySamples;
       this.ackP50Ms = ackP50Ms;
+      this.ackP75Ms = ackP75Ms;
+      this.ackP85Ms = ackP85Ms;
       this.ackP95Ms = ackP95Ms;
       this.ackP99Ms = ackP99Ms;
       this.e2eP50Ms = e2eP50Ms;

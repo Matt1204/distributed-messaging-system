@@ -16,6 +16,9 @@
 .env
 **/.env
 
+## Python (use system/base env for diagram scripts; do not commit venv)
+
+/diagram
 /docs
 /results
 

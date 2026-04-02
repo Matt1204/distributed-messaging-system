@@ -36,7 +36,7 @@ public class HeartbeatManager {
         
         // System.out.println("[client] Ping task started!");
         // Schedule Ping every 10 seconds
-        heartbeatTask = scheduler.scheduleAtFixedRate(this::sendPing, 0, 10, TimeUnit.SECONDS);
+        heartbeatTask = scheduler.scheduleAtFixedRate(this::sendPing, 30, 10, TimeUnit.SECONDS);
     }
 
     public void stop() {
@@ -75,7 +75,7 @@ public class HeartbeatManager {
                 if (pongTimeoutTask != null) {
                     pongTimeoutTask.cancel(false);
                 }
-                pongTimeoutTask = scheduler.schedule(this::handlePongTimeout, 5, TimeUnit.SECONDS);
+                pongTimeoutTask = scheduler.schedule(this::handlePongTimeout, 10, TimeUnit.SECONDS);
                 // System.out.println("[client] Pong task started.");
             }
         } catch (Exception e) {

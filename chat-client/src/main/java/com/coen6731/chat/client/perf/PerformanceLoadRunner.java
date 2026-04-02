@@ -10,6 +10,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.SplittableRandom;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -68,6 +69,10 @@ public final class PerformanceLoadRunner {
             + point.pairs()
             + " ratePerSender="
             + point.ratePerSender()
+            + " arrivalPattern="
+            + config.arrivalPattern.name().toLowerCase()
+            + " rngSeed="
+            + (config.rngSeed == null ? "none" : config.rngSeed)
             + " warmupSec="
             + point.warmupSec()
             + " measureSec="
@@ -79,8 +84,24 @@ public final class PerformanceLoadRunner {
         pairRuntimes.add(pair);
       }
 
-      runPhase(pairRuntimes, point.ratePerSender(), point.warmupSec(), config.payloadBytes, false, collector);
-      runPhase(pairRuntimes, point.ratePerSender(), point.measureSec(), config.payloadBytes, true, collector);
+      runPhase(
+          pairRuntimes,
+          point.ratePerSender(),
+          point.warmupSec(),
+          config.payloadBytes,
+          false,
+          collector,
+          config.arrivalPattern,
+          config.rngSeed);
+      runPhase(
+          pairRuntimes,
+          point.ratePerSender(),
+          point.measureSec(),
+          config.payloadBytes,
+          true,
+          collector,
+          config.arrivalPattern,
+          config.rngSeed);
 
       if (config.drainSec > 0) {
         System.out.println("[perf] drain window " + config.drainSec + "s ...");
@@ -102,6 +123,7 @@ public final class PerformanceLoadRunner {
               config.target,
               config.isProd,
               point.pairs(),
+              config.arrivalPattern.name().toLowerCase(),
               point.ratePerSender(),
               point.warmupSec(),
               point.measureSec(),
@@ -128,12 +150,22 @@ public final class PerformanceLoadRunner {
               config.payloadBytes,
               config.ackTimeoutMs,
               config.e2eTimeoutMs,
+              config.arrivalPattern.name().toLowerCase(),
+              config.rngSeed,
+              config.pairSetupParallelism,
               start,
               end,
               resolveGitCommit());
       CsvReportWriter.writeMetadataJson(metaFile, metadata);
 
       double elapsedSec = (System.nanoTime() - pointStartNs) / 1_000_000_000.0;
+      double attemptedRatePerSec = safeRate(summary.attemptedMessages, point.measureSec());
+      double ackSuccessRate = safeRate(summary.ackedMessages, summary.attemptedMessages);
+      double receiveRate = safeRate(summary.receivedMessages, summary.attemptedMessages);
+      double ackTimeoutRate = safeRate(summary.ackTimeoutCount, summary.attemptedMessages);
+      double e2eTimeoutRate = safeRate(summary.e2eTimeoutCount, summary.attemptedMessages);
+      int ackLatencySamples = summary.ackLatencySamples;
+      int e2eLatencySamples = summary.e2eLatencySamples;
       System.out.println(
           "[perf] point completed="
               + point.scenarioId()
@@ -141,12 +173,44 @@ public final class PerformanceLoadRunner {
               + summary.attemptedMessages
               + " acked="
               + summary.ackedMessages
+              + " ackRate="
+              + formatPercent(ackSuccessRate)
               + " received="
               + summary.receivedMessages
+              + " recvRate="
+              + formatPercent(receiveRate)
+              + " ackTimeout="
+              + summary.ackTimeoutCount
+              + "("
+              + formatPercent(ackTimeoutRate)
+              + ")"
+              + " e2eTimeout="
+              + summary.e2eTimeoutCount
+              + "("
+              + formatPercent(e2eTimeoutRate)
+              + ")"
+              + " attemptedRatePerSec="
+              + format(attemptedRatePerSec)
+              + " ackSamples="
+              + ackLatencySamples
+              + " e2eSamples="
+              + e2eLatencySamples
+              + " ackMedianMs="
+              + format(summary.ackP50Ms)
+              + " ackP75Ms="
+              + format(summary.ackP75Ms)
+              + " ackP85Ms="
+              + format(summary.ackP85Ms)
               + " ackP95Ms="
               + format(summary.ackP95Ms)
+              + " ackP99Ms="
+              + format(summary.ackP99Ms)
+              + " e2eMedianMs="
+              + format(summary.e2eP50Ms)
               + " e2eP95Ms="
               + format(summary.e2eP95Ms)
+              + " e2eP99Ms="
+              + format(summary.e2eP99Ms)
               + " elapsedSec="
               + String.format("%.1f", elapsedSec)
               + " raw="
@@ -211,10 +275,15 @@ public final class PerformanceLoadRunner {
       int durationSec,
       int payloadBytes,
       boolean measured,
-      MetricsCollector collector)
+      MetricsCollector collector,
+      PerfConfig.ArrivalPattern arrivalPattern,
+      Long rngSeed)
       throws InterruptedException {
     if (durationSec <= 0 || pairs.isEmpty()) {
       return;
+    }
+    if (ratePerSender <= 0) {
+      throw new IllegalArgumentException("ratePerSender must be > 0.");
     }
 
     String phaseName = measured ? "MEASURE" : "WARMUP";
@@ -226,7 +295,11 @@ public final class PerformanceLoadRunner {
             + " pairs="
             + pairs.size()
             + " ratePerSender="
-            + ratePerSender);
+            + ratePerSender
+            + " arrivalPattern="
+            + arrivalPattern.name().toLowerCase()
+            + " rngSeed="
+            + (rngSeed == null ? "none" : rngSeed));
 
     long durationNs = durationSec * 1_000_000_000L;
     ExecutorService executor = Executors.newFixedThreadPool(pairs.size());
@@ -236,7 +309,20 @@ public final class PerformanceLoadRunner {
       executor.submit(
           () -> {
             try {
-              sendLoop(pair, ratePerSender, durationNs, payloadBytes, measured, collector);
+              long pairSeed =
+                  rngSeed != null
+                      ? rngSeed ^ (((long) pair.pairId) << 32) ^ (measured ? 1L : 0L)
+                      : System.nanoTime();
+              SplittableRandom rng = new SplittableRandom(pairSeed);
+              sendLoop(
+                  pair,
+                  ratePerSender,
+                  durationNs,
+                  payloadBytes,
+                  measured,
+                  collector,
+                  arrivalPattern,
+                  rng);
             } finally {
               done.countDown();
             }
@@ -254,13 +340,11 @@ public final class PerformanceLoadRunner {
       long durationNs,
       int payloadBytes,
       boolean measured,
-      MetricsCollector collector) {
+      MetricsCollector collector,
+      PerfConfig.ArrivalPattern arrivalPattern,
+      SplittableRandom rng) {
     long startNs = System.nanoTime();
     long endNs = startNs + durationNs;
-
-    int boundedRate = Math.max(1, ratePerSender);
-    long intervalNs = Math.max(1_000_000L, 1_000_000_000L / boundedRate);
-    long nextTickNs = startNs;
 
     while (System.nanoTime() < endNs) {
       long seq = pair.sendCounter.incrementAndGet();
@@ -275,10 +359,34 @@ public final class PerformanceLoadRunner {
               conversationId,
               "");
       collector.registerSend(pair.pairId, clientMsgId, sendStartNs, payloadBytes, measured);
-
-      nextTickNs += intervalNs;
+      long delayNs = nextDelayNs(ratePerSender, arrivalPattern, rng);
+      long nextTickNs = System.nanoTime() + delayNs;
       sleepUntil(nextTickNs);
     }
+  }
+
+  private static long nextDelayNs(
+      int ratePerSender, PerfConfig.ArrivalPattern arrivalPattern, SplittableRandom rng) {
+    return switch (arrivalPattern) {
+      case FIXED -> nextDelayNsFixed(ratePerSender);
+      case POISSON -> nextDelayNsPoisson(ratePerSender, rng);
+    };
+  }
+
+  private static long nextDelayNsFixed(int ratePerSender) {
+    long intervalNs = 1_000_000_000L / ratePerSender;
+    return clampDelayNs(intervalNs);
+  }
+
+  private static long nextDelayNsPoisson(int ratePerSender, SplittableRandom rng) {
+    double u = rng.nextDouble();
+    double delaySec = -Math.log(1.0 - u) / ratePerSender;
+    long delayNs = (long) (delaySec * 1_000_000_000L);
+    return clampDelayNs(delayNs);
+  }
+
+  private static long clampDelayNs(long delayNs) {
+    return Math.max(1_000_000L, Math.min(5_000_000_000L, delayNs));
   }
 
   private static void sleepUntil(long targetNs) {
@@ -323,6 +431,17 @@ public final class PerformanceLoadRunner {
 
   private static String format(double value) {
     return value < 0 ? "n/a" : String.format("%.3f", value);
+  }
+
+  private static String formatPercent(double ratio) {
+    return ratio < 0 ? "n/a" : String.format("%.2f%%", ratio * 100.0);
+  }
+
+  private static double safeRate(int numerator, int denominator) {
+    if (denominator <= 0) {
+      return -1.0;
+    }
+    return (double) numerator / denominator;
   }
 
   private static final class PairRuntime {

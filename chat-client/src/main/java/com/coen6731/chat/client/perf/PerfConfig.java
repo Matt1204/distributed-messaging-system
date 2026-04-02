@@ -6,7 +6,6 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
@@ -34,7 +33,10 @@ public final class PerfConfig {
   public final int cooldownSec;
   public final long connectTimeoutMs;
   public final int catchupLimit;
+  public final int pairSetupParallelism;
   public final String runId;
+  public final ArrivalPattern arrivalPattern;
+  public final Long rngSeed;
 
   public final Integer overridePairs;
   public final Integer overrideRatePerSender;
@@ -55,7 +57,10 @@ public final class PerfConfig {
       int cooldownSec,
       long connectTimeoutMs,
       int catchupLimit,
+      int pairSetupParallelism,
       String runId,
+      ArrivalPattern arrivalPattern,
+      Long rngSeed,
       Integer overridePairs,
       Integer overrideRatePerSender,
       Integer overrideWarmupSec,
@@ -73,7 +78,10 @@ public final class PerfConfig {
     this.cooldownSec = cooldownSec;
     this.connectTimeoutMs = connectTimeoutMs;
     this.catchupLimit = catchupLimit;
+    this.pairSetupParallelism = pairSetupParallelism;
     this.runId = runId;
+    this.arrivalPattern = arrivalPattern;
+    this.rngSeed = rngSeed;
     this.overridePairs = overridePairs;
     this.overrideRatePerSender = overrideRatePerSender;
     this.overrideWarmupSec = overrideWarmupSec;
@@ -97,6 +105,9 @@ public final class PerfConfig {
     }
 
     String scenario = normalizeScenario(firstNonBlank(argMap.get("scenario"), "baseline"));
+    ArrivalPattern arrivalPattern =
+        parseArrivalPattern(firstNonBlank(argMap.get("arrivalPattern"), "fixed"));
+    Long rngSeed = parseNullableLong(argMap.get("rngSeed"));
     String namespace = sanitizeNamespace(firstNonBlank(argMap.get("namespace"), "default"));
     String password = firstNonBlank(argMap.get("password"), "PerfPass#123");
     String isProdRaw =
@@ -114,6 +125,14 @@ public final class PerfConfig {
     int cooldownSec = clampInt(parseInt(argMap.get("cooldownSec"), 15), 0, 600);
     long connectTimeoutMs = clampLong(parseLong(argMap.get("connectTimeoutMs"), 20000L), 1000L, 300000L);
     int catchupLimit = clampInt(parseInt(argMap.get("catchupLimit"), 50), 1, 200);
+    String pairSetupParallelismRaw =
+        firstNonBlank(
+            argMap.get("pairSetupParallelism"),
+            argMap.get("pair-setup-parallelism"),
+            argMap.get("setupParallelism"),
+            dotenv.get("PAIR_SETUP_PARALLELISM"),
+            System.getenv("PAIR_SETUP_PARALLELISM"));
+    int pairSetupParallelism = clampInt(parseInt(pairSetupParallelismRaw, 20), 1, 200);
 
     Integer overridePairs = parseNullableInt(argMap.get("pairs"));
     Integer overrideRate = parseNullableInt(argMap.get("ratePerSender"));
@@ -149,7 +168,10 @@ public final class PerfConfig {
         cooldownSec,
         connectTimeoutMs,
         catchupLimit,
+        pairSetupParallelism,
         runId,
+        arrivalPattern,
+        rngSeed,
         overridePairs,
         overrideRate,
         overrideWarmup,
@@ -162,24 +184,8 @@ public final class PerfConfig {
       case "baseline":
         points.add(buildPoint("baseline", 1, 1, 60, 240));
         break;
-      case "rate-ramp":
-        for (int rate : Arrays.asList(5, 10, 20, 40)) {
-          points.add(buildPoint("rate-ramp-r" + rate, 1, rate, 60, 180));
-        }
-        break;
-      case "concurrency-ramp":
-        for (int pairs : Arrays.asList(1, 5, 10, 20)) {
-          points.add(buildPoint("concurrency-ramp-p" + pairs, pairs, 5, 60, 300));
-        }
-        break;
       case "all":
         points.add(buildPoint("baseline", 1, 1, 60, 240));
-        for (int rate : Arrays.asList(5, 10, 20, 40)) {
-          points.add(buildPoint("rate-ramp-r" + rate, 1, rate, 60, 180));
-        }
-        for (int pairs : Arrays.asList(1, 5, 10, 20)) {
-          points.add(buildPoint("concurrency-ramp-p" + pairs, pairs, 5, 60, 300));
-        }
         break;
       default:
         throw new IllegalStateException("Unsupported scenario: " + scenario);
@@ -202,6 +208,11 @@ public final class PerfConfig {
       int ratePerSender,
       int warmupSec,
       int measureSec) {}
+
+  public enum ArrivalPattern {
+    FIXED,
+    POISSON
+  }
 
   private static Map<String, String> parseArgMap(String[] args) {
     Map<String, String> map = new HashMap<>();
@@ -264,6 +275,17 @@ public final class PerfConfig {
     }
   }
 
+  private static Long parseNullableLong(String raw) {
+    if (isBlank(raw)) {
+      return null;
+    }
+    try {
+      return Long.parseLong(raw.trim());
+    } catch (NumberFormatException ignored) {
+      return null;
+    }
+  }
+
   private static int clampInt(int value, int min, int max) {
     return Math.max(min, Math.min(max, value));
   }
@@ -292,13 +314,24 @@ public final class PerfConfig {
     String normalized = scenario == null ? "baseline" : scenario.trim().toLowerCase(Locale.ROOT);
     switch (normalized) {
       case "baseline":
-      case "rate-ramp":
-      case "concurrency-ramp":
       case "all":
         return normalized;
       default:
         throw new IllegalArgumentException(
-            "Unsupported --scenario '" + scenario + "'. Use baseline|rate-ramp|concurrency-ramp|all");
+            "Unsupported --scenario '" + scenario + "'. Use baseline|all");
+    }
+  }
+
+  private static ArrivalPattern parseArrivalPattern(String raw) {
+    String normalized = raw == null ? "fixed" : raw.trim().toLowerCase(Locale.ROOT);
+    switch (normalized) {
+      case "fixed":
+        return ArrivalPattern.FIXED;
+      case "poisson":
+        return ArrivalPattern.POISSON;
+      default:
+        throw new IllegalArgumentException(
+            "Unsupported --arrivalPattern '" + raw + "'. Use fixed|poisson");
     }
   }
 
