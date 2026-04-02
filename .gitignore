@@ -15,9 +15,9 @@
 
 .env
 **/.env
-
+/diagram
 /docs
-
+/results
 ## OS files
 .DS_Store
 *.db
