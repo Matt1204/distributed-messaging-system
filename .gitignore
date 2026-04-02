@@ -15,7 +15,7 @@
 
 .env
 **/.env
-
+/diagram
 /docs
 /results
 ## OS files
