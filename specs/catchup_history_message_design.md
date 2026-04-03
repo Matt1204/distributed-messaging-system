@@ -1,90 +1,86 @@
 # Catchup and History Synchronization Design (Implemented)
 
-Goal: document the implemented catchup/history synchronization behavior for offline recovery and upward history paging.
+Goal: explain the **implemented** catchup/history behavior in current code, including server constraints and client-side persistence/usage.
 
 Source of truth in current code:
 - `chat-proto/src/main/proto/chat.proto`
 - `chat-server/src/main/java/com/coen6731/chat/server/MessagingServiceImpl.java`
 - `chat-server/src/main/java/com/coen6731/chat/server/CosmosDBHandler.java`
+- `chat-client/src/main/java/com/coen6731/chat/client/ChatClientSession.java`
+- `chat-client/src/main/java/com/coen6731/chat/client/ServerResponseHandler.java`
+- `chat-client/src/main/java/com/coen6731/chat/client/DatabaseManager.java`
 
 Companion document:
-- Persistence internals, sequence allocation, and data-store responsibilities are documented in `docs/message_persistency_design_v2.md`.
+- Persistence internals and send pipeline: `specs/message_persistency_design_v2.md`
 
 ---
 
 ## 1. Core terms first
 
-If you are new to this project, align on these four terms first.
-
 ### 1.1 conversation
 
-`conversation` means one chat thread / session.
+`conversation` means one chat thread.
 
-- DM with user A is one `conversationId`.
-- DM with user B is another `conversationId`.
-- Each conversation has its own message ordering (`sequenceId`).
-
-For dynamic loading, all scrolling/paging/catchup states must be tracked per conversation.
+- Each thread has a unique `conversationId`.
+- Message ordering is maintained per conversation by `sequenceId`.
+- Dynamic loading and sync are all tracked per conversation.
 
 ### 1.2 sequenceId
 
-`sequenceId` is the in-conversation message index; it only increases within the same conversation.
+`sequenceId` is the in-conversation order index.
 
-- It starts from 1 and is monotonic within one conversation.
-- Do not compare `sequenceId` values across different conversations.
-- Example: if A sends 3 messages first, sequence is 1,2,3; then B sends 2, sequence becomes 4,5.
-- Higher `sequenceId` is newer in that conversation.
-
-Example:
-- in conversation Y, latest message may be `sequenceId=9`
-- `120` and `9` have no cross-conversation ordering meaning.
+- It is allocated by server per conversation and increases monotonically.
+- It has **no global ordering** across conversations.
 
 ### 1.3 cursor
 
-`cursor` marks up to which message a conversation is locally synchronized.
+`cursor` means client local sync progress for one conversation.
 
-In this project:
-- Client cursor hint field: `clientLastReceivedSequenceId`
+In protocol terms:
+- `ConversationCursor.clientLastReceivedSequenceId`
 
-You can interpret it as: "which `sequenceId` is already persisted locally."
+In SQLite terms:
+- `local_conversation_cursor.latest_message_sequence_id`
 
 ### 1.4 catchup
 
-`catchup` fills missed persisted messages, mainly used:
-- after login
-- after reconnect
+`catchup` is a breadth-style sync API:
 
-It is not the API for "older history of one conversation." It is a breadth-style sync across all conversations accessible to current user.
+- It checks all conversations accessible to authenticated user.
+- It compares client hint cursor vs server latest sequence.
+- It returns newest missing window per conversation (bounded by limit).
+
+It is **not** the API for deep scrolling one conversation.
 
 ---
 
 ## 2. Transport and envelope
 
-All APIs are multiplexed on one bidirectional gRPC stream:
+All APIs share one bidirectional gRPC stream:
 
 - `MessagingService.Chat(stream ClientEvent) returns (stream ServerEvent)`
 
-Client sends `ClientEvent.oneof payload`; server returns `ServerEvent.oneof payload`.
+This document focuses on:
 
-This document focuses on two synchronization capabilities:
-- `CatchupRequest -> CatchupResult`
-- `GetMsgHistoryRequest -> MsgHistoryResult`
+1. `CatchupRequest -> CatchupResult`
+2. `GetMsgHistoryRequest -> MsgHistoryResult`
 
-Related but out of scope here:
-- `OutboundMessage -> SendMessageAck` is covered in `docs/message_persistency_design_v2.md`.
+Related send path is documented in `specs/message_persistency_design_v2.md`.
 
 ---
 
 ## 3. API 1: Catchup (missing-message synchronization)
 
-### 3.1 What this API is for
+### 3.1 Purpose and precondition
 
-Client purpose: fetch messages that were persisted server-side but not received locally.
-Precondition: stream must already be authenticated; otherwise server returns `ServerError` with `AUTH_NOT_AUTHENTICATED`.
+Use case:
 
-Typical UI timing:
-- after successful login
-- after successful gRPC reconnect
+- after login
+- after reconnect (when authenticated state resumes)
+
+Precondition:
+
+- stream must be authenticated (`AUTH_NOT_AUTHENTICATED` otherwise)
 
 ### 3.2 Request schema
 
@@ -92,20 +88,21 @@ Typical UI timing:
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `cursorHints` | `repeated ConversationCursor` | No | Client hint map of local cursor per conversation |
-| `perConversationLimit` | `int32` | No | Max number of messages returned per conversation |
+| `cursorHints` | `repeated ConversationCursor` | No | Client local cursors |
+| `perConversationLimit` | `int32` | No | Max messages per conversation |
 
 `ConversationCursor`
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `conversationId` | `string` | Recommended | Conversation ID |
-| `clientLastReceivedSequenceId` | `int64` | Recommended | Local synced sequence for that conversation |
+| `clientLastReceivedSequenceId` | `int64` | Recommended | Local cursor |
 
-Server limits (implementation details):
-- `perConversationLimit <= 0` -> defaults to `50`
-- `perConversationLimit > 200` -> capped to `200`
-- negative cursor hints are normalized to `0`
+Implemented normalization:
+
+- `perConversationLimit <= 0` -> default `50`
+- `perConversationLimit > 200` -> cap to `200`
+- negative cursor hints -> normalized to `0`
 
 ### 3.3 Response schema
 
@@ -114,85 +111,45 @@ Server limits (implementation details):
 | Field | Type | Notes |
 |---|---|---|
 | `conversationResults` | `repeated CatchupConversationResult` | One result per authorized conversation |
-| `generatedAtMs` | `int64` | Result generation timestamp |
+| `generatedAtMs` | `int64` | generation timestamp |
 
 `CatchupConversationResult`
 
 | Field | Type | Notes |
 |---|---|---|
 | `conversationId` | `string` | Conversation ID |
-| `conversationLatestSequenceId` | `int64` | Latest persisted sequence from server perspective |
-| `messages` | `repeated CanonicalMessage` | Newest-first (`DESC`) missing window |
+| `conversationLatestSequenceId` | `int64` | Latest durable sequence on server |
+| `messages` | `repeated CanonicalMessage` | Newest-first missing window |
 
-Key semantics (important):
-- Server returns all authorized conversations, not only conversations provided in `cursorHints`.
-- Server may not return all missing records in one call; each conversation is bounded by `perConversationLimit`.
-- Catchup `messages` are **sequence descending (new -> old)**.
-- Strategy is breadth-first across conversations, then bounded newest window per conversation.
-- If one conversation has more missing messages than limit, only the newest window is returned.
-- If `messages` are returned for a conversation, the newest returned record should match current latest for that returned window.
+Implemented semantics:
 
-### 3.4 Example: catchup after login
+1. Server returns all authorized conversations, even if client did not pass them in `cursorHints`.
+2. Returned `messages` are ordered by `sequenceId DESC`.
+3. Returned count per conversation is bounded by limit.
+4. No `appliedClientCursor` field in proto; client derives progress from returned data.
 
-Request (conceptual example):
+### 3.4 Client-side handling (implemented)
 
-```json
-{
-  "catchupRequest": {
-    "perConversationLimit": 5,
-    "cursorHints": [
-      { "conversationId": "conv_alice", "clientLastReceivedSequenceId": 110 }
-    ]
-  }
-}
-```
-
-Response (conceptual, simplified):
-```json
-{
-  "catchupResult": {
-    "generatedAtMs": 1740672000000,
-    "conversationResults": [
-      {
-        "conversationId": "conv_alice",
-        "conversationLatestSequenceId": 126,
-        "messages": [
-          { "sequenceId": 126, "text": "..." },
-          { "sequenceId": 125, "text": "..." },
-          { "sequenceId": 124, "text": "..." },
-          { "sequenceId": 123, "text": "..." },
-          { "sequenceId": 122, "text": "..." }
-        ]
-      },
-      {
-        "conversationId": "conv_bob",
-        "conversationLatestSequenceId": 80,
-        "messages": [
-          { "sequenceId": 80, "text": "..." },
-          { "sequenceId": 79, "text": "..." }
-        ]
-      }
-    ]
-  }
-}
-```
-- For `conv_alice`, there are 16 missing records in total, but with `perConversationLimit = 5`, server returns only the 5 newest.
-- `conv_bob` was not in `cursorHints`, but server still includes it because user membership authorizes it.
-
-Client actions:
-- Persist `messages` idempotently into local DB (dedupe by `serverMsgId` + `conversationId`).
-- Advance local cursor using max sequence returned for that conversation.
+1. Persist each canonical message idempotently into SQLite.
+2. For each conversation result, compute `max(sequenceId)` from returned messages.
+3. If max > 0, upsert local cursor for `(currentUserId, conversationId)`.
+4. Trigger UI refresh.
 
 ---
 
 ## 4. API 2: GetMsgHistory (in-conversation upward paging)
 
-### 4.1 What this API is for
+### 4.1 Purpose and precondition
 
-Client purpose: fetch older messages inside one conversation.
-Precondition: stream must already be authenticated and user must be a conversation member.
+Use case:
 
-It is single-conversation pagination, not global catchup.
+- fetch older messages for one conversation during upward scroll
+
+Precondition:
+
+1. authenticated stream
+2. `conversationId` exists
+3. caller is a member of that conversation
 
 ### 4.2 Request schema
 
@@ -200,16 +157,17 @@ It is single-conversation pagination, not global catchup.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `conversationId` | `string` | Yes | Conversation to page |
-| `beforeSequenceId` | `int64` | Yes | Inclusive upper bound |
-| `retriveMsgQuantity` | `int32` | Yes | How many older rows to return |
+| `conversationId` | `string` | Yes | Target conversation |
+| `beforeSequenceId` | `int64` | Yes | Must be `> 0` |
+| `retriveMsgQuantity` | `int32` | Yes | Must be `> 0`, typo kept by proto |
 
-Server constraints:
-- empty `conversationId` -> error
-- non-member conversation access -> error
-- `beforeSequenceId <= 0` -> error
-- `retriveMsgQuantity <= 0` -> error
-- `retriveMsgQuantity > 200` -> capped to `200`
+Server-side constraints:
+
+- empty `conversationId` -> `BAD_REQUEST`
+- unauthorized conversation -> `CONVERSATION_INVALID`
+- `beforeSequenceId <= 0` -> `BAD_REQUEST`
+- `retriveMsgQuantity <= 0` -> `BAD_REQUEST`
+- `retriveMsgQuantity > 200` -> cap to `200`
 
 ### 4.3 Response schema
 
@@ -221,65 +179,83 @@ Server constraints:
 | `messages` | `repeated CanonicalMessage` | History page |
 
 Ordering semantics:
-- Server returns **sequence descending (new -> old)**.
-- Query is inclusive at `beforeSequenceId`, then older direction for `retriveMsgQuantity`.
 
-### 4.4 Example: `beforeSequenceId=50`, fetch 5 rows
+- server returns `sequenceId DESC`
+- query is inclusive: `sequenceId <= beforeSequenceId`
 
-Request:
+### 4.4 Client-side handling (implemented)
 
-```json
-{
-  "getMsgHistoryRequest": {
-    "conversationId": "conv_alice",
-    "beforeSequenceId": 50,
-    "retriveMsgQuantity": 5
-  }
-}
-```
-
-Response (simplified):
-
-```json
-{
-  "msgHistoryResult": {
-    "conversationId": "conv_alice",
-    "messages": [
-      { "sequenceId": 50, "text": "..." },
-      { "sequenceId": 49, "text": "..." },
-      { "sequenceId": 48, "text": "..." },
-      { "sequenceId": 47, "text": "..." },
-      { "sequenceId": 46, "text": "..." }
-    ]
-  }
-}
-```
-
-Client actions:
-- Persist in returned order (already new -> old).
-- For next request, use `beforeSequenceId = oldestReturnedSequenceId - 1`.
-- If empty array is returned, mark local state as history exhausted for this pagination path.
+1. Persist history messages idempotently.
+2. Do **not** advance forward-sync cursor based on history page.
+3. Notify UI summary callback `onHistoryResultSummary(...)` and refresh UI.
 
 ---
 
-## 5. Boundary with message persistence subsystem
+## 5. Error handling and boundaries
 
-This document intentionally excludes full send-path persistence details to avoid overlap.
+### 5.1 Catchup/history errors
 
-For those details, refer to:
-1. `docs/message_persistency_design_v2.md` section `1.2` (send / persist / delivery flow)
-2. `docs/message_persistency_design_v2.md` section `2.2` (Cosmos/Redis data model)
-3. `docs/message_persistency_design_v2.md` section `4.2.1` and `4.2.3` (sequence allocation and delivery path)
+Catchup/history use `ServerError` path (not send-ack path).
 
-What this document owns:
-1. when and why catchup/history are invoked
-2. request/response semantics for synchronization
-3. client-side cursor and paging behavior for synchronization UX
+Common codes in these APIs:
 
-## 6. Shared payload note (`CanonicalMessage`)
+1. `AUTH_NOT_AUTHENTICATED`
+2. `BAD_REQUEST`
+3. `CONVERSATION_INVALID`
 
-`CatchupResult.messages[]` and `MsgHistoryResult.messages[]` both use `CanonicalMessage`.
+### 5.2 Authentication boundary
 
-For complete field list and persistence interpretation, use:
-1. `chat-proto/src/main/proto/chat.proto` (wire contract)
-2. `docs/message_persistency_design_v2.md` (storage interpretation and idempotent write expectations)
+Catchup/history are blocked until authenticated.
+
+Authentication can be established by:
+
+1. `LoginUser` / `RegisterUser`
+2. valid header-based resume (`x-user-id` -> DB hit)
+
+Security note:
+
+- Header resume is implemented but weak; see `specs/login_register_design.md` risk section.
+
+---
+
+## 6. Ordering, idempotency, and consistency
+
+### 6.1 Ordering
+
+1. Catchup returns newest-first per conversation.
+2. History returns newest-first page.
+3. UI may re-order for display.
+
+### 6.2 Idempotency
+
+Client persistence is idempotent due to local unique indexes and insert-ignore/upsert patterns.
+
+### 6.3 Consistency model in practice
+
+1. Cosmos is durable source of persisted messages.
+2. Redis sequence key is fast allocator, backfilled from Cosmos max on miss.
+3. If live relay is missed, reconnect catchup repairs missing messages.
+
+---
+
+## 7. Implementation checklist (current code alignment)
+
+1. `chat.proto` includes catchup/history request/response messages and fields.
+2. `MessagingServiceImpl` enforces auth + input validation + membership checks.
+3. `CosmosDBHandler` provides:
+   - newest-after-sequence query (`DESC`)
+   - history-by-before-sequence query (`DESC`)
+   - max sequence query
+4. `ChatClientSession` sends catchup after auth/reconnect and supports history request.
+5. `ServerResponseHandler` persists catchup/history idempotently and notifies UI.
+6. `DatabaseManager` stores per-conversation cursor and canonical messages.
+
+---
+
+## 8. Known gaps and non-goals in current implementation
+
+1. No explicit catchup continuation token; large gaps require repeated calls.
+2. Proto field typo `retriveMsgQuantity` remains for compatibility.
+3. No server-side rate limiting for history/catchup requests.
+4. No API version field for evolution negotiation.
+

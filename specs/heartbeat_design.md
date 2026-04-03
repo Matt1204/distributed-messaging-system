@@ -1,100 +1,136 @@
-### 3.2 Consistency and Heartbeat Mechanism
+# Heartbeat and Connection Liveness Design (Implemented)
 
-#### Core issue: dual-state consistency
+This document explains the current heartbeat/liveness implementation across client and server.
 
-The system maintains two online states:
-1. local server state in `connectionsMap`
-2. distributed routing state in Redis (`user:online:{userId}`)
+Source of truth:
 
-If server instances crash or clients disconnect unexpectedly, both states must eventually converge. Otherwise, routing may target dead sessions.
-
-#### Solution: TTL lease model
-
-Redis online state is treated as a renewable lease, not permanent truth.
-
-- **TTL**: online routing key expires after 30 seconds.
-- **Renewal**: each valid authenticated heartbeat renews the TTL.
-
-#### Timing parameters (implemented values)
-
-1. **Client heartbeat interval**: 10s
-2. **Server inactivity timeout**: 30s
-3. **Redis TTL**: 30s
-
-Note: server timeout and Redis TTL are equal in the current implementation.
-
-#### Step-by-step lifecycle management
-
-1. **Connect**
-  - Client establishes a gRPC stream.
-  - After authentication, server registers local session and writes Redis route:
-    - `connectionsMap.put(userId, session)`
-    - `SET user:online:{userId} {instanceId}:{sessionId} EX 30`
-2. **Heartbeat (healthy path)**
-  - Client sends `HeartbeatPing`.
-  - Server always replies with `HeartbeatPong`.
-  - If stream is authenticated, server updates local heartbeat and renews Redis TTL:
-    - `updateHeartbeat(userId)`
-    - `EXPIRE user:online:{userId} 30`
-3. **Client timeout cleanup**
-  - Client stops heartbeats.
-  - Cleanup task removes sessions whose last heartbeat exceeds 30s.
-  - Server performs active cleanup:
-    1. remove session from local map
-    2. delete Redis online key
-4. **Server crash cleanup (passive)**
-  - If a server crashes before cleanup, Redis key is no longer renewed.
-  - Redis automatically expires and removes stale online entries.
+- `chat-client/src/main/java/com/coen6731/chat/client/HeartbeatManager.java`
+- `chat-client/src/main/java/com/coen6731/chat/client/ChatClientSession.java`
+- `chat-client/src/main/java/com/coen6731/chat/client/ServerResponseHandler.java`
+- `chat-server/src/main/java/com/coen6731/chat/server/MessagingServiceImpl.java`
+- `chat-server/src/main/java/com/coen6731/chat/server/ConnectionRegistry.java`
+- `chat-server/src/main/java/com/coen6731/chat/server/RedisHandler.java`
 
 ---
 
-## 3.3 Client-Side Resilience: Detection and Reconnection
+## 1. Core issue: dual online state consistency
 
-> **Design rationale:**
-> Server-side cleanup prevents stale routing state, but good user experience also requires client-side failure detection and reconnect behavior.
+Current system maintains two online-state layers:
 
-### 3.3.1 Failure detection: the 3-strikes rule
+1. local in-memory state: `ConnectionRegistry.connectionsMap`
+2. distributed routing state: Redis `user:online:{userId}` with TTL
 
-Client should not disconnect immediately on one transient failure.
+Both need to converge after disconnects or failures to avoid routing to stale sessions.
 
-- **Ping interval**: 10s
-- **Pong timeout**: 5s
-- **Failure threshold**: 3 consecutive misses
+---
 
-State logic:
-1. **Normal**: send ping, receive pong, reset `missedPongs` to 0.
-2. **Unstable**: ping timeout increments `missedPongs`.
-3. **Dead**: when `missedPongs >= 3`, trigger teardown and reconnect.
+## 2. Implemented timing parameters
 
-### 3.3.2 Teardown phase
+1. client heartbeat ping interval: `10s`
+2. client pong timeout per ping: `5s`
+3. client reconnect trigger threshold: `3` missed pongs
+4. server local session inactivity timeout: `30s`
+5. server cleanup scan interval: `5s`
+6. Redis presence TTL: `30s`
 
-Before reconnecting, client cleans old transport resources:
+---
+
+## 3. Server-side heartbeat behavior
+
+### 3.1 Ping handling
+
+On every `HeartbeatPing`:
+
+1. server sends `HeartbeatPong`
+2. if authenticated stream state is active:
+   - update local session heartbeat (`ConnectionRegistry.updateHeartbeat`)
+   - renew Redis TTL (`RedisHandler.renewUserOnline`)
+
+For unauthenticated streams:
+
+- pong is still returned
+- no user heartbeat update
+- no Redis presence renewal
+
+### 3.2 Local timeout cleanup
+
+`ConnectionRegistry` runs scheduled cleanup:
+
+1. every 5s, scan local sessions
+2. if `now - lastHeartbeat > 30000ms`:
+   - remove local mapping
+   - remove Redis online key
+   - close stream with `TIMEOUT`
+
+### 3.3 Crash/dead-instance cleanup
+
+If server process dies before explicit cleanup:
+
+1. Redis online key stops renewing
+2. key expires by TTL
+3. other replicas stop routing to stale instance/session
+
+---
+
+## 4. Client-side failure detection and reconnect
+
+### 4.1 3-strikes model
+
+`HeartbeatManager` logic:
+
+1. schedule ping every 10s
+2. after each ping, schedule one 5s pong-timeout task
+3. on pong: reset miss counter to 0 and cancel pending timeout
+4. on timeout: increment miss counter
+5. when miss counter >= 3: trigger reconnect callback
+
+### 4.2 Teardown before reconnect
+
+`ChatClientSession.triggerReconnect()` calls teardown path:
 
 1. stop heartbeat tasks
-2. complete/close current stream observer
-3. shutdown current gRPC channel
-4. notify UI as disconnected/reconnecting
+2. mark connection state false
+3. complete current stream observer
+4. shutdown gRPC channel
+5. schedule reconnect with delay
 
-### 3.3.3 Reconnect strategy (exponential backoff + jitter)
+### 4.3 Backoff and jitter
 
-Current implementation:
-- **Base delay**: 1s
-- **Max delay cap**: 5s
-- **Jitter**: random 0~500ms
+Implemented reconnect delay:
 
-This prevents tight reconnect loops and reduces synchronized reconnect spikes.
-
-### 3.3.4 Post-reconnect synchronization
-
-A reconnected transport is not enough; message state may be stale.
-
-1. reconnect becomes healthy
-2. if authenticated state is retained, client reattaches `x-user-id`
-3. client sends `CatchupRequest` with per-conversation cursor hints from SQLite:
-   - `cursorHints[]` (`conversationId`, `clientLastReceivedSequenceId`)
-   - `perConversationLimit`
-4. server returns missing windows via `CatchupResult`
-5. client writes results to local DB and refreshes UI
+1. base delay starts at 1000ms
+2. per-attempt random jitter: 0..500ms
+3. exponential backoff up to 5000ms cap
+4. successful inbound event resets delay to 1000ms
 
 ---
+
+## 5. Post-reconnect synchronization behavior
+
+When reconnect becomes healthy:
+
+1. if client had authenticated state, it may attach `x-user-id` header when creating new stub
+2. client sends catchup once per reconnect cycle (guarded by `catchupPendingAfterReconnect`)
+3. catchup uses local SQLite conversation cursors as hints
+
+This is the implemented recovery path for missed persisted messages.
+
+---
+
+## 6. Critical boundaries and risks
+
+1. Header-based auth resume (`x-user-id`) is implemented but weak from security perspective.
+2. Heartbeat gives transport liveness, not end-to-end delivery guarantee.
+3. Redis TTL expiry and local timeout values are equal (30s); this is simple but may be aggressive under unstable networks.
+4. No adaptive heartbeat interval logic is implemented.
+
+---
+
+## 7. Implementation checklist
+
+1. `HeartbeatPing` and `HeartbeatPong` exist in proto and are wired in stream handlers.
+2. Server heartbeat path updates local + Redis state only when authenticated.
+3. Client 3-strikes reconnect path is active.
+4. Reconnect backoff + jitter is active and capped.
+5. Reconnect catchup trigger is active.
 

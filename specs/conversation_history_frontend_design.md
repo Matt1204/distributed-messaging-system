@@ -1,8 +1,19 @@
 # Design: Client Conversation History Page (Scrollable + Dynamic Fetch)
 
 ## 1. Overview
-This design refactors the client conversation page so one conversation timeline can be browsed with chat-style behavior: newest at bottom, older at top, left/right bubbles, and incremental history loading while scrolling upward. The fetch pipeline is sequence-based and combines local SQLite reads with server `GetMsgHistory` only for missing sequence segments.  
-The separation bar uses a two-step gate: first upward reach at oldest edge blocks scroll and shows prompt text; only the next upward attempt triggers older-history fetch.
+This document explains the **implemented** frontend conversation history behavior in `ChatWindow` and related client classes. The timeline is rendered chat-style (newest near bottom), while older data is loaded on upward scrolling using sequence-based backfill.
+
+The fetch pipeline is sequence-range driven:
+
+1. compute target range from local known sequence state
+2. detect missing sequence segments from SQLite
+3. request server history only for missing segments
+4. re-read full range from SQLite and render
+
+The separation bar uses a two-step gate:
+
+- first top-edge upward attempt: block and show prompt
+- second upward attempt: trigger older-history fetch
 
 ```mermaid
 sequenceDiagram
@@ -13,250 +24,196 @@ sequenceDiagram
     participant G as gRPC Server
 
     U->>UI: Select conversation
-    UI->>DB: Resolve page target range (latestKnown..older)
-    UI->>DB: Check existing sequence ids in range
+    UI->>DB: Resolve initial range (low..high)
+    UI->>DB: List existing sequence ids in range
     alt Missing segments exist
-        loop each missing segment (high -> low)
+        loop each segment high->low
             UI->>S: requestMessageHistory(conversationId, segmentHigh, segmentSize)
             S->>G: GetMsgHistoryRequest
-            G-->>S: MsgHistoryResult (desc sequence)
-            S->>DB: idempotent persist canonical messages
+            G-->>S: MsgHistoryResult (DESC)
+            S->>DB: idempotent persist
         end
     end
-    UI->>DB: Load full page range asc
-    UI-->>U: Render bubbles, scroll at bottom
-    U->>UI: Scroll up to oldest edge
-    UI-->>U: Show separation bar + block first attempt
-    U->>UI: Scroll up again
-    UI->>DB: Resolve next older range and repeat
+    UI->>DB: Load range rows (ASC)
+    UI-->>U: Render bubbles
+    U->>UI: Scroll to top
+    UI-->>U: First gate (show separator)
+    U->>UI: Scroll top again
+    UI->>S: fetch older page
 ```
 
 ## 2. Data Models and APIs
 
-### 2.1 Data Models
-No server schema change is required for this feature. Client runtime state is added.
+### 2.1 Runtime state (implemented)
 
-1. Existing SQLite tables used:
-- `messages(conversation_id, sequence_id, ...)`
-- `local_conversation_cursor(user_id, conversation_id, latest_message_sequence_id, updated_at_ms)`
+`ChatWindow` keeps per-conversation in-memory state:
 
-2. New client runtime model (in-memory):
-- `ConversationViewState`
-  - `conversationId: String`
-  - `latestKnownSequenceId: long` (from `local_conversation_cursor`)
-  - `newestLoadedSequenceId: long`
-  - `oldestLoadedSequenceId: long`
-  - `historyExhausted: boolean`
-  - `isFetchingHistory: boolean`
-  - `separatorGateArmed: boolean` (first blocked attempt done)
-  - `awaitingHistoryResponse: boolean`
+- `latestKnownSequenceId`
+- `renderedHighSequenceId`
+- `renderedLowSequenceId`
+- `historyExpandedByUser`
+- `historyExhausted`
+- `isFetchingHistory`
+- `separatorGateArmed`
+- `separationBarVisible`
 
-3. Optional helper model:
-- `SequenceSegment`
-  - `highInclusive: long`
-  - `lowInclusive: long`
-  - `size(): int`
+Auxiliary models:
 
-### 2.2 API Usage
-1. `CatchupRequest`
-- Used only for reconnect/login sync.
-- Client persists returned messages and sets `local_conversation_cursor.latest_message_sequence_id = conversationLatestSequenceId`.
+- `SequenceSegment(lowInclusive, highInclusive)`
+- `FetchResult(rows, low, high, historyExhausted, effectiveHigh)`
 
-2. `GetMsgHistoryRequest`
-- Request fields used:
-  - `conversationId`
-  - `beforeSequenceId` (inclusive upper bound in current API behavior)
-  - `retriveMsgQuantity` (or generated `limit` setter depending on proto generation)
-- Response:
-  - `MsgHistoryResult(conversationId, messages[])`, messages descending by `sequenceId`.
-- Important semantic note:
-  - Server history query is inclusive (`sequenceId <= beforeSequenceId`).
-  - Local helper `listMessagesBeforeSequence` uses exclusive bound (`sequence_id < beforeSequenceId`) for local reads.
+### 2.2 SQLite APIs used
 
-3. API constraints for design:
-- At most one in-flight history request per conversation to avoid response-to-request ambiguity (response has no request id).
-- Range filling is done by sequential segment fetches (high to low).
+Implemented sequence-based reads:
 
-## 3. Current vs Expected Behavior
+1. `listExistingSequenceIdsInRange(conversationId, start, end)`
+2. `listMessagesBySequenceRange(conversationId, start, end)`
+3. `getConversationCursor(userId, conversationId)`
+4. `getMaxStoredSequenceId(conversationId)`
+
+These are the primary APIs for dynamic range rendering.
+
+### 2.3 Network API used
+
+History pull uses:
+
+- `GetMsgHistoryRequest(conversationId, beforeSequenceId, retriveMsgQuantity)`
+
+Important semantic alignment:
+
+1. server query is inclusive (`sequenceId <= beforeSequenceId`)
+2. client range orchestration prevents duplicates by missing-segment planning + idempotent persistence
+
+## 3. Current behavior by component
 
 ### 3.1 `ChatWindow`
-Current:
-1. Already contains sequence-oriented runtime state and staged history loading scaffolding.
-2. Uses conversation-scoped pending history tracking (`pendingHistoryFetchByConversation`) rather than stateless fire-and-forget.
-3. `onHistoryResultSummary` is actively used to complete waiting fetch flows; `onCatchupResultSummary` is primarily informational/debug.
-4. Bubble rendering uses fixed width with min/max height controls.
 
-Expected:
-1. Selection triggers sequence-based page resolve anchored by `latest_message_sequence_id`.
-2. Scroll-up behavior:
-- At oldest loaded edge and more history available: show separation bar and block first upward attempt.
-- Second upward attempt triggers next older page load.
-3. Renders timeline ordered by `sequenceId` ascending.
-4. Bubble component uses min/max height and fixed width; displays `sequenceId` for debug.
-5. Implements conversation-scoped state machine (`ConversationViewState`) and ignores stale async results when user switches conversation.
+Implemented behavior:
+
+1. selection triggers async initial page load
+2. initial range anchored by max of:
+   - local cursor (`latest_message_sequence_id`)
+   - local max stored sequence
+3. missing segment planner runs high->low
+4. one conversation allows one in-flight history request
+5. stale async results are ignored when selection generation changed
+6. message bubbles show sequence id for debug visibility
 
 ### 3.2 `ChatClientSession`
-Current:
-1. Has request methods for catchup/history and useful local DB query wrappers.
-2. History request method is fire-and-forget.
-3. Uses `setRetriveMsgQuantity(...)` and enforces bounds (`1..200` effective).
 
-Expected:
-1. Keep catchup behavior unchanged.
-2. Expose a conversation-safe history request entry used by UI paging.
-3. Guarantee one in-flight request per conversation (session-level guard or UI-level guard).
+Implemented behavior:
+
+1. `requestMessageHistory` validates auth/state and sends request
+2. request quantity is normalized to positive and capped by 200
+3. helper methods expose local sequence data to UI (`getLatestMessageSequenceId`, `getMaxStoredSequenceId`, range queries)
 
 ### 3.3 `ServerResponseHandler`
-Current:
-1. Persists history pages idempotently and emits summary callback.
-2. Always calls `onConversationDataChanged` after history result.
-3. Emits history summary with `(conversationId, startSequenceId, messageCount)` for UI synchronization.
 
-Expected:
-1. Keep idempotent persist path as source of truth.
-2. Notify history completion in a way UI can continue staged segment fetch (conversation-scoped completion signal).
-3. Continue to avoid cursor advancement on history results.
+Implemented behavior:
+
+1. persists `MsgHistoryResult` idempotently into SQLite
+2. emits summary callback `onHistoryResultSummary(conversationId, startSequenceId, messageCount)`
+3. triggers conversation data refresh callback
 
 ### 3.4 `DatabaseManager`
-Current:
-1. Already supports required range queries:
-- `listExistingSequenceIdsInRange`
-- `listMessagesBySequenceRange`
-- `listMessagesBeforeSequence`
-2. Canonical message upsert is idempotent with unique indexes.
-3. `listLatestMessages` sorts by `sent_at_ms` (not sequence-first).
 
-Expected:
-1. Conversation page pipeline should rely on sequence-range methods, not `sent_at_ms` paging.
-2. Optionally add helper query to read exact page by sequence bounds for less UI-side orchestration.
+Implemented behavior:
 
-## 4. Implementation Details
+1. sequence-range queries return deterministic slices
+2. unique indexes enforce idempotent canonical writes
+3. stored rows can be re-rendered in ascending sequence order
 
-### 4.1 Files and Responsibilities
+## 4. Implemented algorithms
+
+### 4.1 Initial load
+
+1. `latestKnown = session.getLatestMessageSequenceId(conversationId)`
+2. `maxStored = session.getMaxStoredSequenceId(conversationId)`
+3. `high = max(latestKnown, maxStored)`
+4. `low = max(1, high - pageSize + 1)`
+5. if `high <= 0`, mark exhausted
+6. else run `fetchSequenceRangeWithBackfill(conversationId, high, pageSize)`
+
+### 4.2 Missing-segment planner
+
+Given `[low..high]` and `existingSequenceIds`:
+
+1. scan from `high` down to `low`
+2. group contiguous missing ids into segments
+3. for each segment, request history with:
+   - `beforeSequenceId = segment.highInclusive`
+   - `retriveMsgQuantity = segment.size()`
+
+### 4.3 In-flight request guard
+
+One pending future per conversation:
+
+- `pendingHistoryFetchByConversation.putIfAbsent(...)`
+- duplicate in-flight request causes exception and short-circuit
+
+This prevents ambiguous completion matching because history response has no request id.
+
+### 4.4 Top-scroll gate
+
+When scrollbar reaches top:
+
+1. if fetching: ignore
+2. if exhausted: show terminal separator
+3. if not armed: arm gate and show separator text
+4. if armed: disarm and trigger older fetch
+
+### 4.5 Render policy
+
+1. load rows by rendered sequence range
+2. render ascending order
+3. scroll mode:
+   - `TO_BOTTOM` for initial/new-message cases
+   - `TO_TOP` after loading older page
+   - `KEEP_POSITION` when preserving viewport context
+
+## 5. UX and data consistency rules
+
+### 5.1 Timeline consistency
+
+1. rendered content is always from SQLite (single local source)
+2. network responses are persisted first, then UI re-reads local data
+3. this avoids inconsistent direct-from-network rendering
+
+### 5.2 Cursor interaction
+
+1. catchup/live paths may advance cursor
+2. history path should not regress forward cursor intent
+
+### 5.3 Backfill boundaries
+
+1. if `renderedLowSequenceId <= 1`, mark exhausted
+2. if fetch returns empty older page, mark exhausted
+
+## 6. Error and timeout behavior
+
+Implemented behaviors:
+
+1. history segment wait timeout: 8 seconds
+2. on server error callback, all pending history futures complete exceptionally
+3. if fetch fails, keep separator and current range; do not corrupt state
+
+## 7. File responsibilities (current code)
+
 1. `chat-client/src/main/java/com/coen6731/chat/client/ChatWindow.java`
-- Add per-conversation `ConversationViewState` map.
-- Add separation-bar UI component row and gated scroll handling.
-- Replace initial/load-more logic with sequence-based resolver.
-- Keep sender-left / self-right bubble rendering and add min/max bubble height behavior.
-
+   - state machine, top-scroll gate, range backfill, rendering
 2. `chat-client/src/main/java/com/coen6731/chat/client/ChatClientSession.java`
-- Keep history request setter aligned with proto field (`retriveMsgQuantity`) and bounded size.
-- Provide method(s) used by UI pipeline for one conversation page fetch cycle.
-
+   - history request send + local DB query helpers
 3. `chat-client/src/main/java/com/coen6731/chat/client/ServerResponseHandler.java`
-- Keep idempotent `MsgHistoryResult` persistence.
-- Emit conversation-scoped completion callback used by UI gating to continue segment loop.
+   - history result persistence + completion callback
+4. `chat-client/src/main/java/com/coen6731/chat/client/DatabaseManager.java`
+   - range queries + idempotent storage
+5. `chat-client/src/main/java/com/coen6731/chat/client/ClientUiListener.java`
+   - summary callbacks used as fetch completion signal
 
-4. `chat-client/src/main/java/com/coen6731/chat/client/ClientUiListener.java`
-- Add/adjust callback(s) if needed for deterministic history fetch completion, e.g.:
-  - Existing callback `onHistoryResultSummary(String conversationId, long startSequenceId, int messageCount)` can be used as completion signal.
+## 8. Known limitations and critical notes
 
-5. `chat-client/src/main/java/com/coen6731/chat/client/DatabaseManager.java`
-- Reuse existing sequence-range methods.
-- Optional: add `listMessagesBySequencePage(conversationId, highInclusive, pageSize)`.
+1. History response has no request correlation id; per-conversation single in-flight guard is required.
+2. Server history is descending and inclusive at `beforeSequenceId`; client orchestration must stay precise.
+3. Large gaps require multiple segment requests and can increase latency.
+4. No explicit server-side rate limiting for aggressive scroll-driven history pulls.
 
-### 4.2 Core Algorithms
-
-#### A. Target Range Selection
-1. Initial load:
-- `high = latestKnownSequenceId`
-- `low = max(1, high - pageSize + 1)`
-2. Older page load:
-- `high = oldestLoadedSequenceId - 1`
-- `low = max(1, high - pageSize + 1)`
-3. If `high <= 0`, mark `historyExhausted = true`.
-
-#### B. Missing Segment Planner
-Given `[low..high]` and `existingIds`:
-1. Scan from `high` down to `low`.
-2. Group contiguous missing ids into segments `[segmentLow..segmentHigh]`.
-3. Emit in high-to-low order.
-
-Pseudocode:
-```text
-segments = []
-i = high
-while i >= low:
-  if i in existing: i--; continue
-  segHigh = i
-  while i >= low and i not in existing: i--
-  segLow = i + 1
-  segments.add([segLow, segHigh])  // inclusive
-```
-
-For each segment:
-1. Send `GetMsgHistory(conversationId, beforeSequenceId=segHigh, retriveMsgQuantity=segHigh-segLow+1)`.
-2. Wait for corresponding conversation history completion callback.
-3. Persist is already handled by `ServerResponseHandler`.
-
-#### C. Render Step
-1. Re-read `listMessagesBySequenceRange(conversationId, low, high)` after segment fetches complete.
-2. Render ascending by sequence.
-3. Update state:
-- `newestLoadedSequenceId = max(previous, high)`
-- `oldestLoadedSequenceId = min(previous, low)`
-- `historyExhausted = (oldestLoadedSequenceId <= 1 && no additional rows)`
-
-### 4.3 Separation-Bar Gate Logic
-State inputs:
-- `atTop`, `historyExhausted`, `isFetchingHistory`, `separatorGateArmed`.
-
-Rules:
-1. If `atTop && !historyExhausted && !isFetchingHistory && !separatorGateArmed`:
-- show separation bar text `"keep scrolling to fetch older messages"`,
-- force-stop upward movement (keep viewport anchored at bar),
-- set `separatorGateArmed = true`,
-- do not fetch.
-2. If next upward attempt occurs while `separatorGateArmed = true`:
-- clear gate,
-- trigger older-page load,
-- keep bar visible as loading indicator.
-3. On successful load:
-- hide or reposition bar above newly prepended messages.
-4. On failure:
-- keep bar with retry text and allow next upward attempt retry.
-
-### 4.4 Concurrency and Staleness Guards
-1. Each async fetch cycle carries `conversationId` and `generation`.
-2. If user switches conversation before response completion, stale completion events are ignored for rendering.
-3. Only one fetch cycle per conversation at a time (`isFetchingHistory`).
-
-## 5. Progressive Development Plan
-
-### Stage 1: Sequence-Based Initial Load
-1. Add `ConversationViewState` and load selected conversation via sequence target range.
-2. Use SQLite-only path first (no missing-segment fetch yet).
-3. Acceptance: selected conversation renders newest-at-bottom with sequence-ordered bubbles and debug `sequenceId`.
-
-### Stage 2: Segment Fetch + Catchup-Aligned Upper Bound
-1. Implement missing-segment planner and sequential `GetMsgHistory` fetch for gaps.
-2. Wire history completion callback and stale-result guards.
-3. Acceptance: `35..31` with only local `33` triggers two server calls and renders full page ordered.
-
-### Stage 3: Separation-Bar Gated Scroll
-1. Add first-stop/second-fetch separation bar behavior and retry-on-failure behavior.
-2. Finalize bubble sizing (fixed width + min/max height).
-3. Acceptance: first top reach blocks and shows prompt, second upward attempt fetches older page.
-
-## 6. Risks and Watchouts
-1. Proto/client mismatch risk:
-- `GetMsgHistoryRequest` uses `retriveMsgQuantity` in proto and client currently matches this (`setRetriveMsgQuantity(...)`).
-- Keep this aligned across future proto regenerations to avoid drift.
-2. Response correlation risk:
-- `MsgHistoryResult` has no request id; concurrent same-conversation requests are ambiguous.
-- Mitigation: enforce single in-flight history request per conversation.
-3. Ordering risk:
-- Any fallback query by `sent_at_ms` can violate strict sequence timeline.
-- Mitigation: conversation page must use sequence-based queries only.
-4. Scroll UX edge cases:
-- Mouse wheel, trackpad, and scrollbar drag may fire different events.
-- Mitigation: use centralized top-edge detector + explicit gate state transitions.
-5. Observability:
-- Add debug logs per fetch cycle: conversation id, target range, missing segments, request count, success/failure.
-6. Data gap perception:
-- Cursor may point to latest while middle history not local yet (expected by requirement).
-- Mitigation: separation bar + deterministic backfill on upward fetch.
-
-## 7. Missing Inputs
-1. [NEEDS CLARIFICATION] Bubble height rule currently says "min/max height, fixed width" but exact min/max pixel values are not specified.
-2. [NEEDS CLARIFICATION] Separation bar copy is fixed, but final UX for localized text and loading/error variants is not yet specified.
