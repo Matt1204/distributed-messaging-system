@@ -22,3 +22,6 @@
 .DS_Store
 *.db
 containerapp.yaml
+project-report.tex
+specs/architecture_diagram.md
+specs/implementation_structure_diagram.md

@@ -460,14 +460,16 @@ Current server send path emits only:
 
 ## 10. Failure Analysis
 
-| Scenario | Trigger | Current behavior | User impact |
-|---|---|---|---|
-| Send queue full | `SendAsyncExecutor` reject | Returns `FAILED + OVERLOADED` | Send fails, user can retry |
-| Redis unavailable | sequence/presence/relay call fails | sequence allocation or cross-replica live delivery may fail | live delivery may fail, persisted messages recoverable via catchup |
-| Cosmos unavailable | user lookup or message persist fails | returns `INTERNAL` / `PERSISTENCE_FAILED` | auth/send fails |
-| Recipient not found | email lookup empty | `RECIPIENT_NOT_FOUND` ack | send fails |
-| Session heartbeat timeout | no heartbeat for 30s | server cleans session and presence key | client reconnects |
-| Stream disconnect | onError/onCompleted | client reconnect with backoff | temporary unavailable, then catchup |
+
+| Scenario                  | Trigger                              | Current behavior                                            | User impact                                                        |
+| ------------------------- | ------------------------------------ | ----------------------------------------------------------- | ------------------------------------------------------------------ |
+| Send queue full           | `SendAsyncExecutor` reject           | Returns `FAILED + OVERLOADED`                               | Send fails, user can retry                                         |
+| Redis unavailable         | sequence/presence/relay call fails   | sequence allocation or cross-replica live delivery may fail | live delivery may fail, persisted messages recoverable via catchup |
+| Cosmos unavailable        | user lookup or message persist fails | returns `INTERNAL` / `PERSISTENCE_FAILED`                   | auth/send fails                                                    |
+| Recipient not found       | email lookup empty                   | `RECIPIENT_NOT_FOUND` ack                                   | send fails                                                         |
+| Session heartbeat timeout | no heartbeat for 30s                 | server cleans session and presence key                      | client reconnects                                                  |
+| Stream disconnect         | onError/onCompleted                  | client reconnect with backoff                               | temporary unavailable, then catchup                                |
+
 
 Additional note:
 
@@ -631,4 +633,3 @@ This spec is derived from:
 7. `chat-client/db/init.sql`
 
 `docs/` and `specs/` text files are not treated as the source of truth.
-
